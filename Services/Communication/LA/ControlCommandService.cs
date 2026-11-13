@@ -1,0 +1,1787 @@
+﻿using OpenCvWpfTracking.Common;
+using System;
+
+namespace OpenCvWpfTracking.Services.Communication
+{
+    /// <summary>
+    /// [TORUSS] 감시장비 제어 명령 [Packet] 생성 / 송신 서비스
+    ///
+    /// 제어 [Packet] 형식:
+    /// [0] Sync Code  : 0xFF
+    /// [1] Unit ID    : 0x01
+    /// [2] Command 1
+    /// [3] Command 2
+    /// [4] Data 1
+    /// [5] Data 2
+    /// [6] CheckSum   : byte[1] ~ byte[5] 합
+    /// </summary>
+    public class ControlCommandService : IControlCommandServicePort
+    {
+        /// <summary>
+        /// [WEB AGENT](Local Agent) [TCP] 통신 서비스
+        /// </summary>
+        private readonly TcpClientService _tcpClientService;
+
+        /// <summary>
+        /// [Unit ID]
+        ///
+        /// [TORUSS] 문서 기준 기본 [0x01] 고정 사용.
+        /// [Packet] 생성 이후 변경되지 않으므로
+        /// [readonly]로 선언한다.
+        /// </summary>
+        private readonly byte _unitId = 0x01;
+
+        private readonly object _irPaletteSync = new object();
+
+        private const int IrPaletteCount = 10;
+
+        /// <summary>
+        /// 2026-10-16: WebAgent에 추가된 IR 줌 절대 위치 요청 코드.
+        /// 수신 Function 0x29(기계 원점 상태)와는 별개이다.
+        /// </summary>
+        public const byte WebAgentIrZoomAbsoluteCommand = 0xB7;
+
+        public const byte WebAgentTelemetryRateCommand = 0xB9;
+
+        public const byte WebAgentTelemetrySettingQueryCommand = 0xBB;
+
+        public const byte WebAgentTelemetrySnapshotQueryCommand = 0xBD;
+
+        private int _currentIrPaletteIndex;
+
+        private bool _isIrPaletteSynchronized;
+
+        /// <summary>
+        /// 2026-09-15: Web Agent만 사용하는 0 ~ 360도 unsigned Pan 좌표 모드.
+        /// </summary>
+        public bool UseUnsignedWebAgentPanCoordinates { get; set; }
+
+        /// <summary>
+        /// 2026-09-15: Web Agent의 Tilt도 합의된 0 ~ 360도 unsigned 좌표를 사용한다.
+        /// </summary>
+        public bool UseUnsignedWebAgentTiltCoordinates { get; set; }
+
+        /// <summary>
+        /// ControlCommandService 동작 수행 함수.
+        /// </summary>
+        public ControlCommandService(TcpClientService tcpClientService)
+        {
+            _tcpClientService = tcpClientService;
+        }
+
+        /// <summary>
+        /// [TORUSS] 제어 [Packet] 생성 및 송신
+        /// </summary>
+        /// <summary>정밀 이동은 속도와 위치를 같은 프레임으로 묶으며 기존 속도 설정을 변경하지 않는다.</summary>
+        public bool SendPrecisionAbsolute(bool tilt, double guiAngle, double speed, double maximum)
+        {
+            if (tilt ? !UseUnsignedWebAgentTiltCoordinates : !UseUnsignedWebAgentPanCoordinates)
+            {
+                return false;
+            }
+
+            return _tcpClientService.Send(WebAgentMotionFocusProtocol.Absolute(_unitId, tilt, guiAngle, speed, maximum));
+        }
+
+        /// <summary>정밀 조그는 방향을 명령 첫째 바이트에 넣는다. 영 방향은 양 축 정지이다.</summary>
+        public bool SendPrecisionJog(byte direction, double panSpeed, double tiltSpeed, double maximum)
+        {
+            if (!UseUnsignedWebAgentPanCoordinates || !UseUnsignedWebAgentTiltCoordinates)
+            {
+                return false;
+            }
+
+            return _tcpClientService.Send(WebAgentMotionFocusProtocol.Jog(_unitId, direction, panSpeed, tiltSpeed, maximum));
+        }
+
+        /// <summary>자동 초점 조회·설정·한 번 실행을 구분하여 전송한다.</summary>
+        public bool SendAutoFocusCommand(byte command, byte target, byte value)
+        {
+            return _tcpClientService.Send(WebAgentMotionFocusProtocol.AutoFocus(_unitId, command, target, value));
+        }
+
+        /// <summary>
+        /// [TORUSS] 제어 [Packet] 생성 및 송신
+        /// </summary>
+        public bool SendCommand(byte cmd1, byte cmd2, byte data1, byte data2)
+        {
+            byte[] packet =
+            {
+                0xFF,
+                _unitId,
+                cmd1,
+                cmd2,
+                data1,
+                data2,
+                0x00
+            };
+
+            packet[6] = CheckSum(packet, 1, 5);
+
+            return _tcpClientService.Send(packet);
+        }
+
+        /// <summary>
+        /// v2.9 연결별 분리 텔레메트리 전송률을 설정한다.
+        /// Category 0=PT, 1=EO Lens, 2=IR Lens이며 0Hz는 자동 발신 중지다.
+        /// </summary>
+        public bool SetWebAgentTelemetryRate(byte category, byte frequencyHz)
+        {
+            if (category > 2)
+            {
+                throw new ArgumentOutOfRangeException(nameof(category), category, "전송률 설정 Category는 0~2 범위여야 합니다.");
+            }
+
+            if (frequencyHz > 30)
+            {
+                throw new ArgumentOutOfRangeException(nameof(frequencyHz), frequencyHz, "분리 텔레메트리 전송률은 0~30Hz 범위여야 합니다.");
+            }
+
+            return SendCommand(0x00, WebAgentTelemetryRateCommand, category, frequencyHz);
+        }
+
+        /// <summary>
+        /// v2.9 Category별 현재 GUI 전달 설정을 조회한다.
+        /// Category 0=PT, 1=EO Lens, 2=IR Lens, 3=Power다.
+        /// </summary>
+        public bool RequestWebAgentTelemetrySetting(byte category)
+        {
+            ValidateTelemetryQueryCategory(category);
+
+            return SendCommand(0x00, WebAgentTelemetrySettingQueryCommand, category, 0x00);
+        }
+
+        /// <summary>
+        /// v2.9 Category별 캐시를 단건 조회한다.
+        /// 자동 발신이 0Hz인 경우에도 사용할 수 있다.
+        /// </summary>
+        public bool RequestWebAgentTelemetrySnapshot(byte category)
+        {
+            ValidateTelemetryQueryCategory(category);
+
+            return SendCommand(0x00, WebAgentTelemetrySnapshotQueryCommand, category, 0x00);
+        }
+
+        private static void ValidateTelemetryQueryCategory(byte category)
+        {
+            if (category > 3)
+            {
+                throw new ArgumentOutOfRangeException(nameof(category), category, "텔레메트리 조회 Category는 0~3 범위여야 합니다.");
+            }
+        }
+
+        /// <summary>
+        /// 2026-10-02: WebAgent에 최신 GPS 상태를 단건 조회한다.
+        /// 패킷 예시: FF 01 00 A3 00 00 A4
+        /// </summary>
+        public bool RequestGpsTelemetry()
+        {
+            return _tcpClientService.Send(BuildGpsTelemetryQueryPacket());
+        }
+
+        public static byte[] BuildGpsTelemetryQueryPacket()
+        {
+            return new byte[]
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xA3,
+                0x00,
+                0x00,
+                0xA4
+            };
+        }
+
+        /// <summary>
+        /// 2026-10-02: 모든 GUI 연결에 공통 적용되는 GPS 자동 전송률을 설정한다.
+        /// 0Hz는 자동 전송 중지이며 단건 조회는 계속 사용할 수 있다.
+        /// </summary>
+        public bool SetGpsAutoTxRate(byte frequencyHz)
+        {
+            return _tcpClientService.Send(BuildGpsAutoTxRatePacket(frequencyHz));
+        }
+
+        public static byte[] BuildGpsAutoTxRatePacket(byte frequencyHz)
+        {
+            if (frequencyHz > 10)
+            {
+                throw new ArgumentOutOfRangeException(nameof(frequencyHz), frequencyHz, "GPS auto TX rate must be between 0 and 10 Hz.");
+            }
+
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xF7,
+                frequencyHz,
+                0x00,
+                0x00
+            };
+
+            packet[6] = CheckSum(packet, 1, 5);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// 2026-10-02: 현재 GPS 자동 전송률을 조회한다.
+        /// 패킷 예시: FF 01 00 F9 00 00 FA
+        /// </summary>
+        public bool RequestGpsAutoTxRate()
+        {
+            return _tcpClientService.Send(BuildGpsAutoTxRateQueryPacket());
+        }
+
+        public static byte[] BuildGpsAutoTxRateQueryPacket()
+        {
+            return new byte[]
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xF9,
+                0x00,
+                0x00,
+                0xFA
+            };
+        }
+
+        /// <summary>
+        /// 2026-10-06: WebAgent를 통해 EO/IR 장비 전원을 제어한다.
+        /// 요청 성공만으로 화면 상태를 바꾸지 않으며, 실제 ON/OFF 표시는
+        /// Function 0x31의 MCB/SCB 보드 상태 비트를 기준으로 갱신한다.
+        /// </summary>
+        public bool SetDevicePower(byte deviceCode, bool turnOn)
+        {
+            return _tcpClientService.Send(BuildDevicePowerPacket(deviceCode, turnOn));
+        }
+
+        /// <summary>
+        /// 전원 요청: FF 01 CMD1 00 DEVICE 00 CHECKSUM.
+        /// CMD1 ON=0x88, OFF=0x08. 현재 GUI는 EO(0x00), IR(0x01)을 제공한다.
+        /// </summary>
+        public static byte[] BuildDevicePowerPacket(byte deviceCode, bool turnOn)
+        {
+            if (deviceCode != 0x00 && deviceCode != 0x01)
+            {
+                throw new ArgumentOutOfRangeException(nameof(deviceCode), deviceCode, "GUI device power control supports EO(0x00) and IR(0x01).");
+            }
+
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                turnOn ? (byte)0x88 : (byte)0x08,
+                0x00,
+                deviceCode,
+                0x00,
+                0x00
+            };
+
+            packet[6] = CheckSum(packet, 1, 5);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// 2026-10-01: WebAgent Build 86 이상에서 RPY 자동 전송 주파수를 설정한다.
+        /// 0Hz는 자동 전송 중지이며 허용 범위는 0~30Hz이다.
+        /// </summary>
+        public bool SetRpyAutoTxRate(byte frequencyHz)
+        {
+            if (frequencyHz > 30)
+            {
+                throw new ArgumentOutOfRangeException(nameof(frequencyHz), frequencyHz, "RPY auto TX rate must be between 0 and 30 Hz.");
+            }
+
+            return _tcpClientService.Send(BuildRpyAutoTxRatePacket(frequencyHz));
+        }
+
+        /// <summary>
+        /// RPY 자동 전송 주파수 7Byte 요청 Packet을 생성한다.
+        /// 예시: 10Hz → FF 01 00 EB 0A 00 F6
+        /// </summary>
+        public static byte[] BuildRpyAutoTxRatePacket(byte frequencyHz)
+        {
+            if (frequencyHz > 30)
+            {
+                throw new ArgumentOutOfRangeException(nameof(frequencyHz), frequencyHz, "RPY auto TX rate must be between 0 and 30 Hz.");
+            }
+
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xEB,
+                frequencyHz,
+                0x00,
+                0x00
+            };
+
+            packet[6] = CheckSum(packet, 1, 5);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// 2026-10-01: Roll/Pitch/Yaw 오프셋을 하나의 11Byte 요청으로 전송한다.
+        /// Roll/Pitch는 signed int16, Yaw는 unsigned uint16이며 모두 0.01도 단위,
+        /// Little Endian 순서로 배치한다.
+        /// </summary>
+        public bool SetRpyOffsets(short rollHundredths, short pitchHundredths, ushort yawHundredths)
+        {
+            return _tcpClientService.Send(BuildRpyOffsetPacket(rollHundredths, pitchHundredths, yawHundredths));
+        }
+
+        /// <summary>
+        /// RPY 오프셋 요청 Packet을 생성한다.
+        /// 예시: 1.00, -2.00, 30.00 →
+        /// FF 01 00 ED 64 00 38 FF B8 0B 4C
+        /// </summary>
+        public static byte[] BuildRpyOffsetPacket(short rollHundredths, short pitchHundredths, ushort yawHundredths)
+        {
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xED,
+                (byte)(rollHundredths & 0xFF),
+                (byte)((rollHundredths >> 8) & 0xFF),
+                (byte)(pitchHundredths & 0xFF),
+                (byte)((pitchHundredths >> 8) & 0xFF),
+                (byte)(yawHundredths & 0xFF),
+                (byte)((yawHundredths >> 8) & 0xFF),
+                0x00
+            };
+
+            packet[10] = CheckSum(packet, 1, 9);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// 2026-10-01: WebAgent Build 93 이상에서 DB에 저장된
+        /// Roll/Pitch/Yaw Offset을 직접 조회한다.
+        /// 패킷 예시: FF 01 00 F3 00 00 F4
+        /// </summary>
+        public bool RequestStoredRpyOffsets()
+        {
+            return _tcpClientService.Send(BuildStoredRpyOffsetQueryPacket());
+        }
+
+        public static byte[] BuildStoredRpyOffsetQueryPacket()
+        {
+            return new byte[]
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xF3,
+                0x00,
+                0x00,
+                0xF4
+            };
+        }
+
+        /// <summary>
+        /// 2026-10-01: WebAgent Build 93 이상에서 DB에 저장된
+        /// RPY 자동 전송 주파수를 직접 조회한다.
+        /// 패킷 예시: FF 01 00 F5 00 00 F6
+        /// </summary>
+        public bool RequestStoredRpyAutoTxRate()
+        {
+            return _tcpClientService.Send(BuildStoredRpyAutoTxRateQueryPacket());
+        }
+
+        public static byte[] BuildStoredRpyAutoTxRateQueryPacket()
+        {
+            return new byte[]
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xF5,
+                0x00,
+                0x00,
+                0xF6
+            };
+        }
+
+        /// <summary>
+        /// 2026-10-01: WebAgent 현재 UTC 날짜·시간을 조회한다.
+        /// 패킷 예시: FF 01 00 F1 00 00 F2
+        /// </summary>
+        public bool RequestSystemDateTime()
+        {
+            return SendCommand(0x00, 0xF1, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// 2026-10-01: PC 현재 시간을 UTC로 변환하여 WebAgent OS 시간으로 설정한다.
+        /// 시간대는 변경하지 않으며 초 단위까지만 전송한다.
+        /// </summary>
+        public bool SetSystemDateTimeUtc(DateTime utcDateTime)
+        {
+            return _tcpClientService.Send(BuildSystemDateTimePacket(utcDateTime));
+        }
+
+        /// <summary>
+        /// UTC 날짜·시간 설정 12Byte Packet을 생성한다.
+        /// 예시: 2026-10-01 03:04:05 UTC →
+        /// FF 01 00 EF EA 07 0A 01 03 04 05 F8
+        /// </summary>
+        public static byte[] BuildSystemDateTimePacket(DateTime dateTime)
+        {
+            DateTime utcDateTime = dateTime.Kind == DateTimeKind.Local ? dateTime.ToUniversalTime() : DateTime.SpecifyKind(dateTime, DateTimeKind.Utc);
+
+            if (utcDateTime.Year < 1970 || utcDateTime.Year > 9999)
+            {
+                throw new ArgumentOutOfRangeException(nameof(dateTime), dateTime, "System UTC year must be between 1970 and 9999.");
+            }
+
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                0x00,
+                0xEF,
+                (byte)(utcDateTime.Year & 0xFF),
+                (byte)((utcDateTime.Year >> 8) & 0xFF),
+                (byte)utcDateTime.Month,
+                (byte)utcDateTime.Day,
+                (byte)utcDateTime.Hour,
+                (byte)utcDateTime.Minute,
+                (byte)utcDateTime.Second,
+                0x00
+            };
+
+            packet[11] = CheckSum(packet, 1, 10);
+
+            return packet;
+        }
+
+        // WEB AGENT의 추가 상태 조회 명령을 구성한다.
+        public bool RequestWebAgentIdentity()
+        {
+            return SendCommand(0x00, 0xE1, 0x00, 0x00);
+        }
+
+        public bool RequestLensCapability(byte target)
+        {
+            return SendCommand(0x00, 0xE3, target, 0x00);
+        }
+
+        public bool RequestLensTelemetry(byte target)
+        {
+            return SendCommand(0x00, 0xE3, target, 0x01);
+        }
+
+        public bool RequestLensCapabilityAndTelemetry(byte target)
+        {
+            return SendCommand(0x00, 0xE3, target, 0x02);
+        }
+
+        public bool RequestImuTelemetry()
+        {
+            return SendCommand(0x00, 0xE5, 0x00, 0x00);
+        }
+
+        public bool RequestCameraFeatureCapability(byte target)
+        {
+            return SendCommand(0x00, 0xE7, target, 0xFF);
+        }
+
+        public bool RequestCameraFeatureState(byte target, byte featureId)
+        {
+            return SendCommand(0x00, 0xE7, target, featureId);
+        }
+
+        public bool SetCameraFeature(byte featureId, byte target, byte value)
+        {
+            return SendCommand(featureId, 0xE9, target, value);
+        }
+
+        public bool MoveHomePosition(byte axis)
+        {
+            return SendCommand(0x00, 0xB1, axis, 0x00);
+        }
+
+        /// <summary>
+        /// WebAgent에 현재 Encoder 위치를 0으로 재정의하도록 요청한다.
+        ///
+        /// Cmd2 0xB3은 2026-09-29 제안 규격이며 WebAgent 구현 확정 전까지
+        /// 송신 성공은 TCP 전달 성공만 의미한다. 실제 장비 ZERO 완료 여부는
+        /// 향후 WebAgent 성공/실패 응답 규격으로 별도 판정해야 한다.
+        /// </summary>
+        /// <param name = "axis">0x01: PAN, 0x02: TILT</param>
+        public bool RequestWebAgentPositionZero(byte axis)
+        {
+            if (axis != 0x01 && axis != 0x02)
+            {
+                throw new ArgumentOutOfRangeException(nameof(axis), axis, "WebAgent ZERO axis must be 0x01 (PAN) or 0x02 (TILT).");
+            }
+
+            return SendCommand(0x00, 0xB3, axis, 0x00);
+        }
+
+        /// <summary>
+        /// 2026-09-30: TILT Set Zero 이후 변경된 실제 동작 범위를
+        /// WebAgent에 조회한다.
+        ///
+        /// 패킷 예시: FF 01 00 B5 02 00 B8
+        /// Cmd2  : 0xB5 (TILT 제한값 조회)
+        /// Data1 : 0x02 (TILT 축)
+        /// </summary>
+        public bool RequestWebAgentTiltLimits()
+        {
+            return SendCommand(0x00, 0xB5, 0x02, 0x00);
+        }
+
+        /// <summary>
+        /// [CheckSum] 계산 함수
+        /// 지정 범위의 [byte] 합산값 반환
+        /// </summary>
+        private static byte CheckSum(byte[] data, int startIndex, int length)
+        {
+            byte sum = 0;
+
+            for (int i = startIndex; i < startIndex + length; i++)
+            {
+                sum += data[i];
+            }
+
+            return sum;
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 Pan / Tilt Home Position 실행.
+        ///
+        /// UICommandParser:
+        /// Command2 = 0xB1
+        /// pm-&gt;StartHoming();
+        /// tm-&gt;StartHoming();
+        /// </summary>
+        public bool MoveHomePosition()
+        {
+            return SendCommand(0x00, 0xB1, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// [Pan] 이동 시 원점 통과 모드 설정
+        ///
+        /// TORUSS / Pelco-D 확장 명령:
+        /// Command2 = 0x4D
+        /// Data1    = 0x01
+        /// Data2    = 0x00
+        ///
+        /// 이후 Pan 위치 이동 명령에서 장비가 원점 통과 경로를 선택한다.
+        /// </summary>
+        public bool SetPanViaZeroMode()
+        {
+            return SendCommand(0x00, 0x4D, 0x01, 0x00);
+        }
+
+        /// <summary>
+        /// [Pan] 이동 시 최단거리 선택 모드 설정
+        ///
+        /// TORUSS / Pelco-D 확장 명령:
+        /// Command2 = 0x4D
+        /// Data1    = 0x02
+        /// Data2    = 0x00
+        ///
+        /// 이후 Pan 위치 이동 명령에서 장비가 최단 회전 경로를 선택한다.
+        /// </summary>
+        public bool SetPanShortestPathMode()
+        {
+            return SendCommand(0x00, 0x4D, 0x02, 0x00);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 프리셋 ID를 설정한다.
+        ///
+        /// Command2 = 0x19
+        /// Data1/Data2 = ID (0 ~ 99, Big Endian)
+        /// </summary>
+        public bool SetLaPresetId(ushort presetId)
+        {
+            presetId = NormalizeLaPresetId(presetId);
+
+            return SendUnsignedShortCommand(0x19, presetId);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 프리셋 Pan 위치를 설정한다.
+        ///
+        /// Command2 = 0x91
+        /// Data1/Data2 = Degree * 100 (signed short, Big Endian)
+        /// </summary>
+        public bool SetLaPresetPan(double pan)
+        {
+            if (UseUnsignedWebAgentPanCoordinates)
+            {
+                return SendUnsignedWebAgentPanDegreeCommand(0x91, pan);
+            }
+
+            return SendSignedDegreeCommand(0x91, pan);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 프리셋 Tilt 위치를 설정한다.
+        ///
+        /// Command2 = 0x93
+        /// Data1/Data2 = Degree * 100 (signed short, Big Endian)
+        /// </summary>
+        public bool SetLaPresetTilt(double tilt)
+        {
+            if (UseUnsignedWebAgentTiltCoordinates)
+            {
+                return SendUnsignedPanDegreeCommand(0x93, tilt);
+            }
+
+            return SendSignedDegreeCommand(0x93, tilt);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 프리셋 Zoom 위치를 설정한다.
+        ///
+        /// Command2 = 0x95
+        /// Data1/Data2 = Position (0 ~ 1000, Big Endian)
+        /// </summary>
+        public bool SetLaPresetZoom(ushort position)
+        {
+            position = NormalizePresetPosition(position);
+
+            return SendUnsignedShortCommand(0x95, position);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 프리셋 Focus 위치를 설정하고,
+        /// LA 내부 scan-&gt;AddPreset()을 완료한다.
+        ///
+        /// Command2 = 0x97
+        /// Data1/Data2 = Position (0 ~ 1000, Big Endian)
+        /// </summary>
+        public bool SetLaPresetFocusAndCommit(ushort position)
+        {
+            position = NormalizePresetPosition(position);
+
+            return SendUnsignedShortCommand(0x97, position);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 프리셋 위치로 이동한다.
+        ///
+        /// 실제 LA UICommandParser 구현:
+        /// case 0x05:
+        ///     scan-&gt;GotoPreset(GetInteger(data1, data2));
+        ///
+        /// Command2 = 0x05
+        /// Data1/Data2 = ID (0 ~ 99, Big Endian)
+        /// </summary>
+        public bool MoveToLaPreset(ushort presetId)
+        {
+            presetId = NormalizeLaPresetId(presetId);
+
+            return SendUnsignedShortCommand(0x05, presetId);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 스캔 이동 모드를 순환(CYCLE)으로 설정한다.
+        ///
+        /// UICommandParser:
+        /// Command2 = 0x1B
+        /// Data1 = 0x01 : CYCLE
+        /// Data2 = 0x00
+        ///
+        /// P01 -> P02 -> ... -> P01 반복 순회를 보장하기 위해
+        /// AUTO SCAN START 직전에 송신한다.
+        /// </summary>
+        public bool SetLaPresetScanCycleMode()
+        {
+            return SendCommand(0x00, 0x1B, 0x01, 0x00);
+        }
+
+        /// <summary>
+        /// LA 실제 구현 기준 전체 스캔 프리셋 데이터를 초기화한다.
+        ///
+        /// Command2 = 0x9B
+        /// Data1 = 0x00
+        /// Data2 = 0x01
+        /// </summary>
+        public bool ClearAllLaPresets()
+        {
+            return SendCommand(0x00, 0x9B, 0x00, 0x01);
+        }
+
+        /// <summary>
+        /// signed Degree 값을 Degree * 100으로 변환하여
+        /// Big Endian 2byte 명령으로 송신한다.
+        /// </summary>
+        private bool SendSignedDegreeCommand(byte command2, double degree)
+        {
+            double safeDegree = Math.Max(-180.0, Math.Min(180.0, degree));
+
+            short value = safeDegree < 0.0 ? (short)((safeDegree - 0.005) * 100.0) : (short)((safeDegree + 0.005) * 100.0);
+
+            byte data1 = (byte)((value >> 8) & 0xFF);
+
+            byte data2 = (byte)(value & 0xFF);
+
+            return SendCommand(0x00, command2, data1, data2);
+        }
+
+        /// <summary>
+        /// unsigned 16bit 값을 Big Endian 2byte 명령으로 송신한다.
+        /// </summary>
+        private bool SendUnsignedShortCommand(byte command2, ushort value)
+        {
+            byte data1 = (byte)((value >> 8) & 0xFF);
+
+            byte data2 = (byte)(value & 0xFF);
+
+            return SendCommand(0x00, command2, data1, data2);
+        }
+
+        /// <summary>
+        /// NormalizeLaPresetId 동작 수행 함수.
+        /// </summary>
+        private static ushort NormalizeLaPresetId(ushort presetId)
+        {
+            if (presetId > 99)
+            {
+                return (ushort)99;
+            }
+            else
+            {
+                return presetId;
+            }
+        }
+
+        /// <summary>
+        /// NormalizePresetPosition 동작 수행 함수.
+        /// </summary>
+        private static ushort NormalizePresetPosition(ushort position)
+        {
+            if (position > 1000)
+            {
+                return (ushort)1000;
+            }
+            else
+            {
+                return position;
+            }
+        }
+
+        /// <summary>
+        /// 현재 PTZF 위치를 프리셋 슬롯에 추가 / 갱신한다.
+        ///
+        /// TORUSS 프리셋 실행 / 편집 명령:
+        /// Command2 = 0x03
+        /// Data1    = 0x00
+        /// Data2    = Preset Number
+        ///
+        /// 유효 슬롯:
+        /// 1 ~ 100
+        /// </summary>
+        public bool AddPresetPoint(byte presetNumber)
+        {
+            presetNumber = NormalizePresetNumber(presetNumber);
+
+            return SendCommand(0x00, 0x03, 0x00, presetNumber);
+        }
+
+        /// <summary>
+        /// 프리셋 슬롯을 제거한다.
+        ///
+        /// TORUSS 프리셋 실행 / 편집 명령:
+        /// Command2 = 0x05
+        /// Data1    = 0x00
+        /// Data2    = Preset Number
+        /// </summary>
+        public bool RemovePresetPoint(byte presetNumber)
+        {
+            presetNumber = NormalizePresetNumber(presetNumber);
+
+            return SendCommand(0x00, 0x05, 0x00, presetNumber);
+        }
+
+        /// <summary>
+        /// 저장된 프리셋 슬롯으로 이동한다.
+        ///
+        /// TORUSS 프리셋 실행 / 편집 명령:
+        /// Command2 = 0x07
+        /// Data1    = 0x00
+        /// Data2    = Preset Number
+        /// </summary>
+        public bool MoveToPresetPoint(byte presetNumber)
+        {
+            presetNumber = NormalizePresetNumber(presetNumber);
+
+            return SendCommand(0x00, 0x07, 0x00, presetNumber);
+        }
+
+        /// <summary>
+        /// 프리셋 오토 스캔을 시작한다.
+        ///
+        /// TORUSS 프리셋 설정 / 오토 스캔 명령:
+        /// Command2 = 0x99
+        /// Data1    = Speed (1 ~ 60)
+        /// Data2    = Delay (1 ~ 60)
+        /// </summary>
+        public bool StartPresetScan(byte speed, byte delay)
+        {
+            speed = NormalizePresetScanValue(speed);
+
+            delay = NormalizePresetScanValue(delay);
+
+            return SendCommand(0x00, 0x99, speed, delay);
+        }
+
+        /// <summary>
+        /// 프리셋 오토 스캔을 정지한다.
+        ///
+        /// TORUSS 프리셋 설정 / 오토 스캔 명령:
+        /// Command2 = 0x9B
+        /// Data1    = 0x00
+        /// Data2    = 0x00
+        ///
+        /// Data2 = 0x01은 프리셋 데이터 초기화이므로
+        /// 일반 정지 함수에서는 사용하지 않는다.
+        /// </summary>
+        public bool StopPresetScan()
+        {
+            return SendCommand(0x00, 0x9B, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// 실행 중인 프리셋 스캔의 속도 / 정지시간을 변경한다.
+        ///
+        /// TORUSS 프리셋 설정 / 오토 스캔 명령:
+        /// Command2 = 0x9D
+        /// Data1    = Speed (1 ~ 60)
+        /// Data2    = Delay (1 ~ 60)
+        /// </summary>
+        public bool UpdatePresetScan(byte speed, byte delay)
+        {
+            speed = NormalizePresetScanValue(speed);
+
+            delay = NormalizePresetScanValue(delay);
+
+            return SendCommand(0x00, 0x9D, speed, delay);
+        }
+
+        /// <summary>
+        /// 프리셋 번호를 프로그램 지원 범위 1 ~ 100로 제한한다.
+        /// </summary>
+        private static byte NormalizePresetNumber(byte presetNumber)
+        {
+            if (presetNumber < 1)
+            {
+                return 1;
+            }
+
+            if (presetNumber > 100)
+            {
+                return 100;
+            }
+
+            return presetNumber;
+        }
+
+        /// <summary>
+        /// 스캔 Speed / Delay를 문서 허용 범위 1 ~ 60으로 제한한다.
+        /// </summary>
+        private static byte NormalizePresetScanValue(byte value)
+        {
+            if (value < 1)
+            {
+                return 1;
+            }
+
+            if (value > 60)
+            {
+                return 60;
+            }
+
+            return value;
+        }
+
+        /// <summary>
+        /// 사용자 정의 Pan 위치 이동 속도를 설정한다.
+        ///
+        /// Command2 = 0x49
+        /// Speed    = deg/s * 100 (unsigned short, Big Endian)
+        /// </summary>
+        public bool SetPanPositionSpeed(double speedDegreesPerSecond)
+        {
+            ushort speedValue = ConvertPositionSpeed(speedDegreesPerSecond);
+
+            return SendCommand(0x00, 0x49, (byte)((speedValue >> 8) & 0xFF), (byte)(speedValue & 0xFF));
+        }
+
+        /// <summary>
+        /// 사용자 정의 Tilt 위치 이동 속도를 설정한다.
+        ///
+        /// Command2 = 0x4B
+        /// Speed    = deg/s * 100 (unsigned short, Big Endian)
+        /// </summary>
+        public bool SetTiltPositionSpeed(double speedDegreesPerSecond)
+        {
+            ushort speedValue = ConvertPositionSpeed(speedDegreesPerSecond);
+
+            return SendCommand(0x00, 0x4B, (byte)((speedValue >> 8) & 0xFF), (byte)(speedValue & 0xFF));
+        }
+
+        /// <summary>
+        /// ConvertPositionSpeed 생성 및 변환 함수.
+        /// </summary>
+        private static ushort ConvertPositionSpeed(double speedDegreesPerSecond)
+        {
+            double safeSpeed = Math.Max(0.0, Math.Min(655.35, speedDegreesPerSecond));
+
+            return (ushort)Math.Round(safeSpeed * 100.0, MidpointRounding.AwayFromZero);
+        }
+
+        /// <summary>
+        /// [Pan] 위치 제어 명령
+        ///
+        /// 입력 기준은 -180 ~ 180도이다.
+        ///
+        /// 범위를 벗어난 내부 계산값은 signed Pan 범위로 정규화한 뒤,
+        /// 위치 값을 [각도 * 100]하여
+        /// [Data1 / Data2]에 [Big Endian] 방식으로 설정한다.
+        /// </summary>
+        public bool PanGoPosition(double pan)
+        {
+            if (UseUnsignedWebAgentPanCoordinates)
+            {
+                return SendUnsignedWebAgentPanDegreeCommand(0x45, pan);
+            }
+
+            while (pan > 180.0)
+            {
+                pan -= 360.0;
+            }
+
+            while (pan < -180.0)
+            {
+                pan += 360.0;
+            }
+
+            short value = pan < 0 ? (short)((pan - 0.005) * 100) : (short)((pan + 0.005) * 100);
+
+            byte data1 = (byte)((value >> 8) & 0xFF);
+
+            byte data2 = (byte)(value & 0xFF);
+
+            return SendCommand(0x00, 0x45, data1, data2);
+        }
+
+        /// <summary>
+        /// GUI의 -180 ~ 180도 Pan을 Web Agent의 0 ~ 360도, 0.01도 단위로 변환한다.
+        /// </summary>
+        private bool SendUnsignedPanDegreeCommand(byte command2, double pan)
+        {
+            double normalizedPan = pan % 360.0;
+
+            if (normalizedPan < 0.0)
+            {
+                normalizedPan += 360.0;
+            }
+
+            ushort value = (ushort)Math.Round(normalizedPan * 100.0, MidpointRounding.AwayFromZero);
+
+            if (value >= 36000)
+            {
+                value = 0;
+            }
+
+            return SendCommand(0x00, command2, (byte)((value >> 8) & 0xFF), (byte)(value & 0xFF));
+        }
+
+        /// <summary>
+        /// 2026-09-16: GUI 우회전 증가 Pan을 Web Agent 우회전 감소 좌표로 변환한다.
+        /// </summary>
+        private bool SendUnsignedWebAgentPanDegreeCommand(byte command2, double guiPan)
+        {
+            return SendUnsignedPanDegreeCommand(command2, 360.0 - guiPan);
+        }
+
+        /// <summary>
+        /// Pelco-D Pan / Tilt 속도를 문서 허용 범위 [0 ~ 63]으로 제한한다.
+        ///
+        /// UI의 0=STOP 정책과 1~50 환산은 ViewModel에서 처리하며,
+        /// Service는 최종 Packet 값이 허용 범위를 벗어나지 않도록 방어한다.
+        /// </summary>
+        private static byte NormalizePanTiltProtocolSpeed(byte speed)
+        {
+            if (speed > 0x3F)
+            {
+                return (byte)0x3F;
+            }
+            else
+            {
+                return speed;
+            }
+        }
+
+        /// <summary>
+        /// [PAN] 우측 연속 이동 시작
+        ///
+        /// [Command2 Bit0 = Pan Right]
+        /// [Data1 = Pan Speed Level] [0 ~ 63]
+        /// </summary>
+        public bool StartPanRight(byte speed = 20)
+        {
+            byte protocolSpeed = NormalizePanTiltProtocolSpeed(speed);
+
+            return SendCommand(0x00, 0x02, protocolSpeed, 0x00);
+        }
+
+        /// <summary>
+        /// [PAN] 좌측 연속 이동 시작
+        ///
+        /// [Command2 Bit1 = Pan Left]
+        /// [Data1 = Pan Speed Level] [0 ~ 63]
+        /// </summary>
+        public bool StartPanLeft(byte speed = 20)
+        {
+            byte protocolSpeed = NormalizePanTiltProtocolSpeed(speed);
+
+            return SendCommand(0x00, 0x04, protocolSpeed, 0x00);
+        }
+
+        /// <summary>
+        /// [Tilt] 위치 제어 명령
+        /// </summary>
+        public bool TiltGoPosition(double tilt)
+        {
+            if (UseUnsignedWebAgentTiltCoordinates)
+            {
+                return SendUnsignedPanDegreeCommand(0x47, tilt);
+            }
+
+            while (tilt > 180.0)
+            {
+                tilt -= 360.0;
+            }
+
+            while (tilt < -180.0)
+            {
+                tilt += 360.0;
+            }
+
+            short value = tilt < 0 ? (short)((tilt - 0.005) * 100) : (short)((tilt + 0.005) * 100);
+
+            byte data1 = (byte)((value >> 8) & 0xFF);
+
+            byte data2 = (byte)(value & 0xFF);
+
+            return SendCommand(0x00, 0x47, data1, data2);
+        }
+
+        /// <summary>
+        /// [TILT] 위쪽 연속 이동 시작
+        ///
+        /// [Command2 Bit2 = Tilt Up]
+        /// [Data2 = Tilt Speed Level] [0 ~ 63]
+        /// </summary>
+        public bool StartTiltUp(byte speed = 20)
+        {
+            byte protocolSpeed = NormalizePanTiltProtocolSpeed(speed);
+
+            return SendCommand(0x00, 0x08, 0x00, protocolSpeed);
+        }
+
+        /// <summary>
+        /// [TILT] 아래쪽 연속 이동 시작
+        ///
+        /// [Command2 Bit3 = Tilt Down]
+        /// [Data2 = Tilt Speed Level] [0 ~ 63]
+        /// </summary>
+        public bool StartTiltDown(byte speed = 20)
+        {
+            byte protocolSpeed = NormalizePanTiltProtocolSpeed(speed);
+
+            return SendCommand(0x00, 0x10, 0x00, protocolSpeed);
+        }
+
+        /// <summary>
+        /// [PAN LEFT + TILT UP] 좌측 상단 대각선 연속 이동 시작
+        ///
+        /// [Command2]
+        /// Pan Left : 0x04
+        /// Tilt Up  : 0x08
+        /// 결합값   : 0x0C
+        ///
+        /// [Data1] = Pan Speed
+        /// [Data2] = Tilt Speed
+        /// </summary>
+        public bool StartPanLeftTiltUp(byte panSpeed = 20, byte tiltSpeed = 20)
+        {
+            byte protocolPanSpeed = NormalizePanTiltProtocolSpeed(panSpeed);
+
+            byte protocolTiltSpeed = NormalizePanTiltProtocolSpeed(tiltSpeed);
+
+            return SendCommand(0x00, 0x0C, protocolPanSpeed, protocolTiltSpeed);
+        }
+
+        /// <summary>
+        /// [PAN RIGHT + TILT UP] 우측 상단 대각선 연속 이동 시작
+        ///
+        /// [Command2]
+        /// Pan Right : 0x02
+        /// Tilt Up   : 0x08
+        /// 결합값    : 0x0A
+        ///
+        /// [Data1] = Pan Speed
+        /// [Data2] = Tilt Speed
+        /// </summary>
+        public bool StartPanRightTiltUp(byte panSpeed = 20, byte tiltSpeed = 20)
+        {
+            byte protocolPanSpeed = NormalizePanTiltProtocolSpeed(panSpeed);
+
+            byte protocolTiltSpeed = NormalizePanTiltProtocolSpeed(tiltSpeed);
+
+            return SendCommand(0x00, 0x0A, protocolPanSpeed, protocolTiltSpeed);
+        }
+
+        /// <summary>
+        /// [PAN LEFT + TILT DOWN] 좌측 하단 대각선 연속 이동 시작
+        ///
+        /// [Command2]
+        /// Pan Left  : 0x04
+        /// Tilt Down : 0x10
+        /// 결합값    : 0x14
+        ///
+        /// [Data1] = Pan Speed
+        /// [Data2] = Tilt Speed
+        /// </summary>
+        public bool StartPanLeftTiltDown(byte panSpeed = 20, byte tiltSpeed = 20)
+        {
+            byte protocolPanSpeed = NormalizePanTiltProtocolSpeed(panSpeed);
+
+            byte protocolTiltSpeed = NormalizePanTiltProtocolSpeed(tiltSpeed);
+
+            return SendCommand(0x00, 0x14, protocolPanSpeed, protocolTiltSpeed);
+        }
+
+        /// <summary>
+        /// [PAN RIGHT + TILT DOWN] 우측 하단 대각선 연속 이동 시작
+        ///
+        /// [Command2]
+        /// Pan Right : 0x02
+        /// Tilt Down : 0x10
+        /// 결합값    : 0x12
+        ///
+        /// [Data1] = Pan Speed
+        /// [Data2] = Tilt Speed
+        /// </summary>
+        public bool StartPanRightTiltDown(byte panSpeed = 20, byte tiltSpeed = 20)
+        {
+            byte protocolPanSpeed = NormalizePanTiltProtocolSpeed(panSpeed);
+
+            byte protocolTiltSpeed = NormalizePanTiltProtocolSpeed(tiltSpeed);
+
+            return SendCommand(0x00, 0x12, protocolPanSpeed, protocolTiltSpeed);
+        }
+
+        /// <summary>
+        /// Pan 위치 이동을 정지한다.
+        ///
+        /// TORUSS 위치 제어 명령:
+        /// Command2 = 0x4F
+        /// Data1    = 0x01 (Pan Position Stop)
+        /// Data2    = 0x00
+        /// </summary>
+        public bool StopPanPositionMove()
+        {
+            return SendCommand(0x00, 0x4F, 0x01, 0x00);
+        }
+
+        /// <summary>
+        /// Tilt 위치 이동을 정지한다.
+        ///
+        /// TORUSS 위치 제어 명령:
+        /// Command2 = 0x4F
+        /// Data1    = 0x02 (Tilt Position Stop)
+        /// Data2    = 0x00
+        /// </summary>
+        public bool StopTiltPositionMove()
+        {
+            return SendCommand(0x00, 0x4F, 0x02, 0x00);
+        }
+
+        /// <summary>
+        /// Pan과 Tilt 위치 이동 정지 명령을 순서대로 송신한다.
+        /// PRESET GOTO 또는 ABSOLUTE 위치 이동 중지에 사용한다.
+        /// </summary>
+        public bool StopPanTiltPositionMove()
+        {
+            bool panResult = StopPanPositionMove();
+
+            bool tiltResult = StopTiltPositionMove();
+
+            ConsoleLogHelper.Command("POSITION STOP", $"PAN={panResult} / TILT={tiltResult} / CMD2=0x4F");
+
+            return panResult && tiltResult;
+        }
+
+        /// <summary>
+        /// 전체 연속 속도제어 정지
+        /// </summary>
+        public bool StopMove()
+        {
+            Console.WriteLine();
+
+            Console.WriteLine("[CONTROL] STOP MOVE");
+
+            Console.WriteLine("[CONTROL] STOP COMMAND PARAMETER : " + "CMD1=0x00, CMD2=0x00, DATA1=0x00, DATA2=0x00");
+
+            bool result = SendCommand(0x00, 0x00, 0x00, 0x00);
+
+            Console.WriteLine($"[CONTROL] STOP SEND RESULT : {result}");
+
+            ConsoleLogHelper.PrintLine();
+
+            return result;
+        }
+
+        /// <summary>
+        /// PTZ(회전형) 카메라 [Zoom] 위치 제어 명령
+        /// 범위: [0 ~ 1000]
+        /// </summary>
+        public bool EoZoomGoPosition(short zoom)
+        {
+            if (zoom > 1000)
+            {
+                zoom = 1000;
+            }
+            else if (zoom < 0)
+            {
+                zoom = 0;
+            }
+
+            byte data1 = (byte)((zoom >> 8) & 0xFF);
+
+            byte data2 = (byte)(zoom & 0xFF);
+
+            return SendCommand(0x00, 0x37, data1, data2);
+        }
+
+        /// <summary>
+        /// [EO] [ZOOM] [Tele] 연속제어 시작
+        ///
+        /// [Command2 Bit5 = Zoom Tele]
+        /// </summary>
+        public bool StartEoZoomTele()
+        {
+            return SendCommand(0x00, 0x20, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// [EO] [ZOOM] [Wide] 연속제어 시작
+        ///
+        /// [Command2 Bit6 = Zoom Wide]
+        /// </summary>
+        public bool StartEoZoomWide()
+        {
+            return SendCommand(0x00, 0x40, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// 2026-09-17: Web Agent EO Zoom 연속제어 전용 정지.
+        /// v1.8 추가 프로토콜의 축별 STOP을 사용하여 EO Zoom 정지가
+        /// 이후 PAN/TILT 제어 상태까지 초기화하지 않도록 한다.
+        /// 패킷 예시: FF 01 00 51 01 00 53
+        /// </summary>
+        public bool StopEoZoom()
+        {
+            return SendCommand(0x00, 0x51, 0x01, 0x00);
+        }
+
+        /// <summary>
+        /// [EO] PTZ(회전형) 카메라 [Focus] 위치 제어 명령
+        /// 범위: [0 ~ 1000]
+        /// </summary>
+        public bool EoFocusGoPosition(short focus)
+        {
+            if (focus > 1000)
+            {
+                focus = 1000;
+            }
+            else if (focus < 0)
+            {
+                focus = 0;
+            }
+
+            byte data1 = (byte)((focus >> 8) & 0xFF);
+
+            byte data2 = (byte)(focus & 0xFF);
+
+            return SendCommand(0x00, 0x39, data1, data2);
+        }
+
+        /// <summary>
+        /// [EO] 주간 카메라 Focus 연속 제어 속도 설정
+        ///
+        /// Command2 = 0x27
+        /// Data2    = Speed [0 ~ 3]
+        ///
+        /// 우선 최소 속도 Level 0을 사용한다.
+        /// 장비 반응 확인 후 1 ~ 3 범위에서 조정한다.
+        /// </summary>
+        public bool SetEoFocusSpeed(byte speed)
+        {
+            if (speed > 3)
+            {
+                speed = 3;
+            }
+
+            Console.WriteLine();
+
+            Console.WriteLine($"[CONTROL] EO FOCUS SPEED SET : {speed}");
+
+            return SendCommand(0x00, 0x27, 0x00, speed);
+        }
+
+        /// <summary>
+        /// [EO] [FOCUS] [Near] 연속제어 시작
+        ///
+        /// [Command2 Bit0 = Focus Near]
+        /// </summary>
+        public bool StartEoFocusNear()
+        {
+            return SendCommand(0x01, 0x00, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// [EO] [FOCUS] [Far] 연속제어 시작
+        ///
+        /// [Command1 Bit7 = Focus Far]
+        /// </summary>
+        public bool StartEoFocusFar()
+        {
+            return SendCommand(0x00, 0x80, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// 2026-09-17: Web Agent EO Focus 연속제어 전용 정지.
+        /// v1.8 추가 프로토콜의 축별 STOP을 사용하여 EO Focus 정지가
+        /// 이후 PAN/TILT 제어 상태까지 초기화하지 않도록 한다.
+        /// 패킷 예시: FF 01 00 51 02 00 54
+        /// </summary>
+        public bool StopEoFocus()
+        {
+            return SendCommand(0x00, 0x51, 0x02, 0x00);
+        }
+
+        /// <summary>
+        /// [EO] 주간 카메라 [One Push Auto Focus] 요청
+        ///
+        /// Toruss V1 EO/IR 연동규격서 rev15의
+        /// 주간 카메라 제어 확장 명령을 동일한 제어 TCP 연결로 송신한다.
+        ///
+        /// [Command1 = 0x00]
+        /// [Command2 = 0x35]
+        /// [Data1    = 0xAF]
+        /// [Data2    = 0x00]
+        /// [Packet   = FF 01 00 35 AF 00 E5]
+        /// </summary>
+        public bool StartEoAutoFocus()
+        {
+            return SendCommand(0x00, 0x35, 0xAF, 0x00);
+        }
+
+        /// <summary>
+        /// LA 규격 2.6의 열영상 줌 위치 이동 명령이다. 저장된 제어 위치를 상위 바이트부터 송신한다.
+        /// 반전된 수신 좌표를 송신값으로 재사용하지 않는다. WEB 0xB7과 구분하고 실제 응답으로 도착을 확인한다.
+        /// </summary>
+        public bool LaIrZoomGoPosition(int standardPosition)
+        {
+            if (standardPosition < 0 || standardPosition > 1000)
+            {
+                return false;
+            }
+
+            return SendUnsignedShortCommand(0x29, (ushort)standardPosition);
+        }
+
+        /// <summary>
+        /// 2026-10-16: WebAgent IR 줌 절대 위치를 CMD2=0xB7로 요청한다.
+        /// 위치 0~1000을 상위/하위 바이트 순서로 송신하며 화각×100 값이 아니다.
+        /// 범위를 벗어난 값은 보정해 송신하지 않고 거절한다.
+        /// 송신 성공은 장비 도달 확인과 다르며 기존 렌즈 피드백으로 확인한다.
+        /// </summary>
+        public bool IrZoomGoPosition(short zoom)
+        {
+            if (zoom < 0 || zoom > 1000)
+            {
+                ConsoleLogHelper.Warning("WEB AGENT IR ZOOM", $"RESULT=INVALID_POSITION / CMD2=0xB7 / POSITION={zoom} / RANGE=0~1000");
+
+                return false;
+            }
+
+            bool sent = _tcpClientService.Send(BuildWebAgentIrZoomPositionPacket(zoom));
+
+            ConsoleLogHelper.Command("WEB AGENT IR ZOOM", $"CMD2=0xB7 / POSITION={zoom} / SENT={sent}");
+
+            return sent;
+        }
+
+        /// <summary>
+        /// 2026-10-16: IR 줌 B7 요청의 7바이트 패킷을 생성한다.
+        /// FF를 제외한 Unit ID~POS_L의 합 하위 8비트를 체크섬으로 사용한다.
+        /// 예: 위치 500 → FF 01 00 B7 01 F4 AD.
+        /// </summary>
+        public static byte[] BuildWebAgentIrZoomPositionPacket(int position)
+        {
+            if (position < 0 || position > 1000)
+            {
+                throw new ArgumentOutOfRangeException(nameof(position), position, "IR 줌 절대 위치는 0~1000 범위여야 합니다.");
+            }
+
+            byte[] packet =
+            {
+                0xFF,
+                0x01,
+                0x00,
+                WebAgentIrZoomAbsoluteCommand,
+                (byte)((position >> 8) & 0xFF),
+                (byte)(position & 0xFF),
+                0x00
+            };
+
+            packet[6] = CheckSum(packet, 1, 5);
+
+            return packet;
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [ZOOM] [Tele] 연속제어 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x00] : Zoom In Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrZoomTele()
+        {
+            return SendCommand(0x00, 0x31, 0x00, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [ZOOM] [Wide] 연속제어 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x01] : Zoom Out Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrZoomWide()
+        {
+            return SendCommand(0x00, 0x31, 0x01, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [ZOOM] 연속제어 정지
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0xFF] : Zoom Stop
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StopIrZoom()
+        {
+            return SendCommand(0x00, 0x31, 0xFF, 0x00);
+        }
+
+        /// <summary>
+        /// v2.91 [IR] 열영상 카메라 [Focus] 절대 위치 제어 명령.
+        /// 범위 0(Far)~1000(Near)을 Big Endian으로 송신한다.
+        /// 장비가 직접 절대이동을 지원하지 않으면 상위 이동 로직이
+        /// 기존 0x31 Near/Far/Stop 폐루프로 자동 전환한다.
+        /// </summary>
+        public bool IrFocusGoPosition(short focus)
+        {
+            if (focus < 0 || focus > 1000)
+            {
+                ConsoleLogHelper.Warning("WEB AGENT IR FOCUS", $"RESULT=INVALID_POSITION / CMD2=0x2B / POSITION={focus} / RANGE=0~1000");
+
+                return false;
+            }
+
+            byte data1 = (byte)((focus >> 8) & 0xFF);
+
+            byte data2 = (byte)(focus & 0xFF);
+
+            return SendCommand(0x00, 0x2B, data1, data2);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [FOCUS] [Near] 연속제어 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x03] : Focus Near Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrFocusNear()
+        {
+            return SendCommand(0x00, 0x31, 0x03, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [FOCUS] [Far] 연속제어 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x04] : Focus Far Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrFocusFar()
+        {
+            return SendCommand(0x00, 0x31, 0x04, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [FOCUS] 연속제어 정지
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x05] : Focus Stop
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StopIrFocus()
+        {
+            return SendCommand(0x00, 0x31, 0x05, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [Digital Zoom] 확대 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x07] : Digital Zoom In Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrDigitalZoomIn()
+        {
+            return SendCommand(0x00, 0x31, 0x07, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [Digital Zoom] 축소 시작
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x08] : Digital Zoom Out Start
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrDigitalZoomOut()
+        {
+            return SendCommand(0x00, 0x31, 0x08, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [Digital Zoom] 정지
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x06] : Digital Zoom Stop
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StopIrDigitalZoom()
+        {
+            return SendCommand(0x00, 0x31, 0x06, 0x00);
+        }
+
+        /// <summary>
+        /// [IR] 열영상 카메라 [Auto Focus] 요청
+        ///
+        /// [Command2 = 0x31]
+        /// [Data1 = 0x02] : Auto Focus
+        /// [Data2 = 0x00]
+        /// </summary>
+        public bool StartIrAutoFocus()
+        {
+            return SendCommand(0x00, 0x31, 0x02, 0x00);
+        }
+
+        #region [IR 열상 영상 제어]
+
+        /// <summary>
+        /// SendIrImageControlCommand 송신 함수.
+        /// </summary>
+        private bool SendIrImageControlCommand(byte operation)
+        {
+            return SendCommand(0x00, 0x31, operation, 0x00);
+        }
+
+        /// <summary>
+        /// 실제 장비 Palette를 BLACK HOT으로 초기화하고
+        /// 프로그램의 현재 Palette Index를 동기화한다.
+        /// </summary>
+        public bool InitializeIrPaletteToBlackHot()
+        {
+            lock (_irPaletteSync)
+            {
+                // 검정 고온은 반전 회색조 명령 0xF4를 사용한다.
+                if (!SendIrImageControlCommand(0xF4))
+                {
+                    _isIrPaletteSynchronized = false;
+
+                    return false;
+                }
+
+                _currentIrPaletteIndex = 0;
+                _isIrPaletteSynchronized = true;
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// 동기화된 현재 Palette에서 선택한 Palette까지
+        /// 필요한 NEXT 또는 PREV 명령만 송신한다.
+        /// 이미 선택된 Palette를 다시 적용하면 명령을 송신하지 않는다.
+        /// </summary>
+        public bool SelectIrPalette(byte paletteIndex)
+        {
+            if (paletteIndex >= IrPaletteCount)
+            {
+                return false;
+            }
+
+            lock (_irPaletteSync)
+            {
+                if (!_isIrPaletteSynchronized)
+                {
+                    return false;
+                }
+
+                int targetIndex = paletteIndex;
+
+                if (targetIndex == _currentIrPaletteIndex)
+                {
+                    return true;
+                }
+
+                int nextCount = (targetIndex - _currentIrPaletteIndex + IrPaletteCount) % IrPaletteCount;
+
+                int previousCount = (_currentIrPaletteIndex - targetIndex + IrPaletteCount) % IrPaletteCount;
+
+                byte operation;
+
+                int moveCount;
+
+                if (nextCount <= previousCount)
+                {
+                    operation = 0x0D;
+                    moveCount = nextCount;
+                }
+                else
+                {
+                    operation = 0x0E;
+                    moveCount = previousCount;
+                }
+
+                for (int index = 0; index < moveCount; index++)
+                {
+                    if (!SendIrImageControlCommand(operation))
+                    {
+                        // 일부 명령만 적용됐을 수 있으므로 추적값을 폐기한다.
+                        _isIrPaletteSynchronized = false;
+
+                        return false;
+                    }
+
+                    if (index + 1 < moveCount)
+                    {
+                        System.Threading.Thread.Sleep(75);
+                    }
+                }
+
+                _currentIrPaletteIndex = targetIndex;
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// SelectNextIrPalette 동작 수행 함수.
+        /// </summary>
+        public bool SelectNextIrPalette()
+        {
+            return SendEnvironmentIrPaletteCommand(0x0D);
+        }
+
+        /// <summary>
+        /// SelectPreviousIrPalette 동작 수행 함수.
+        /// </summary>
+        public bool SelectPreviousIrPalette()
+        {
+            return SendEnvironmentIrPaletteCommand(0x0E);
+        }
+
+        /// <summary>
+        /// SelectIrBlackHot 동작 수행 함수.
+        /// </summary>
+        public bool SelectIrBlackHot()
+        {
+            // 검정 고온은 반전 회색조 팔레트 0xF4이다.
+            return SendEnvironmentIrPaletteCommand(0xF4);
+        }
+
+        /// <summary>
+        /// SelectIrWhiteHot 동작 수행 함수.
+        /// </summary>
+        public bool SelectIrWhiteHot()
+        {
+            // 흰색 고온은 일반 회색조 팔레트 0xF3이다.
+            return SendEnvironmentIrPaletteCommand(0xF3);
+        }
+
+        /// <summary>
+        /// SelectIrRainbow 동작 수행 함수.
+        /// </summary>
+        public bool SelectIrRainbow()
+        {
+            // 무지개 팔레트 직접 선택 명령은 0xF5이다.
+            return SendEnvironmentIrPaletteCommand(0xF5);
+        }
+
+        /// <summary>
+        /// SendEnvironmentIrPaletteCommand 송신 함수.
+        /// </summary>
+        private bool SendEnvironmentIrPaletteCommand(byte operation)
+        {
+            lock (_irPaletteSync)
+            {
+                bool result = SendIrImageControlCommand(operation);
+
+                // ENVIRONMENT 상대/직접 명령은 ROOFTOP의 10단계 추적값과
+                // 독립적이므로 다음 ROOFTOP 진입 시 반드시 재동기화한다.
+                _isIrPaletteSynchronized = false;
+
+                return result;
+            }
+        }
+
+        /// <summary>
+        /// 열영상 NUC 잔열 보정을 요청한다.
+        /// </summary>
+        public bool RequestIrNuc()
+        {
+            // 2026-08-14: 규격서 2.7 기준 NUC = Command2 0x31, Data1 0x0F.
+            return SendCommand(0x00, 0x31, 0x0F, 0x00);
+        }
+
+        #endregion
+
+        /// <summary>
+        /// 거리측정기 [1회] 측정 요청
+        ///
+        /// [Command2 = 0x57]
+        /// </summary>
+        public bool ReadOnceLrfValue()
+        {
+            return SendCommand(0x00, 0x57, 0x00, 0x00);
+        }
+    }
+}

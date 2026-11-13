@@ -1,0 +1,939 @@
+﻿using OpenCvWpfTracking.Common;
+using OpenCvWpfTracking.ViewModels.Main;
+using System;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Threading;
+using System.Windows.Media;
+
+// 2026-10-16: 이벤트 하위 탭과 실제 뷰포트 기준 페이지 표시.
+// 코드 정비: 한국어 설명과 함수 간격·region을 정리하며 기존 운용 흐름은 유지한다.
+namespace OpenCvWpfTracking
+{
+    /// <summary>
+    /// AI와 FIRE 이벤트를 현재 표 높이에 맞춘 페이지 단위로 표시하고 선택 삭제를 제공한다.
+    /// </summary>
+    public partial class EventAlertControl : UserControl
+    {
+        private EventPageController _aiPager;
+
+        private EventPageController _firePager;
+
+        private MainViewModel _subscribedViewModel;
+
+        private bool _hadActiveAiEvent;
+
+        private bool _hadActiveFireEvent;
+
+        public EventAlertControl()
+        {
+            InitializeComponent();
+
+            Loaded += EventAlertControl_Loaded;
+
+            Unloaded += EventAlertControl_Unloaded;
+
+            DataContextChanged += EventAlertControl_DataContextChanged;
+        }
+
+        /// <summary>
+        /// 선택한 구역 이벤트의 상세 화면을 연다.
+        /// </summary>
+        private void ZoneEventDetail_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            var row = ItemsControl.ContainerFromElement((DataGrid)sender, e.OriginalSource as DependencyObject) as DataGridRow;
+
+            if (!(row?.Item is FireEventRecord record))
+            {
+                return;
+            }
+
+            MessageBox.Show(Window.GetWindow(this), "EVENT " + record.EventId + " / " + record.Camera + " / " + record.DetectionType + "\n\n" + record.ZoneDetailText, "FIRE / SMOKE 위치 구역", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+
+        /// <summary>
+        /// 2026-08-21: 두 이벤트 표의 가변 페이지 View를 최초 한 번만 연결한다.
+        /// </summary>
+        private void EventAlertControl_Loaded(object sender, RoutedEventArgs e)
+        {
+            if (_aiPager == null)
+            {
+                _aiPager = new EventPageController(AiEventGrid, AiTotalText, AiSelectedText, AiPageText, AiPreviousButton, AiNextButton);
+
+                _firePager = new EventPageController(FireEventGrid, FireTotalText, FireSelectedText, FirePageText, FirePreviousButton, FireNextButton);
+            }
+
+            SubscribeEventCollections(DataContext as MainViewModel);
+
+            // 2026-08-24: 최초 표시와 상위 이벤트 알림 탭 진입 시에만 최신 이벤트 탭을 선택한다.
+            // 행 추가마다 재선택하지 않아 사용자가 이후 AI/FIRE 하위 탭을 자유롭게 전환할 수 있다.
+            SelectLatestEventTab();
+        }
+
+        /// <summary>
+        /// 2026-08-24: Control 재로드 및 DataContext 교체 시 이벤트 컬렉션 구독을 안전하게 갱신한다.
+        /// 새 이벤트 Add만 자동 탭 선택 대상으로 사용하며 삭제·초기화 Reset은 제외한다.
+        /// </summary>
+        private void EventAlertControl_DataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (IsLoaded)
+            {
+                SubscribeEventCollections(e.NewValue as MainViewModel);
+            }
+        }
+
+        /// <summary>
+        /// 이벤트 화면을 분리할 때 등록한 수신 구독을 해제한다.
+        /// </summary>
+        private void EventAlertControl_Unloaded(object sender, RoutedEventArgs e)
+        {
+            SubscribeEventCollections(null);
+        }
+
+        /// <summary>
+        /// 현재 ViewModel의 이벤트 목록 변경을 구독한다.
+        /// </summary>
+        private void SubscribeEventCollections(MainViewModel viewModel)
+        {
+            if (ReferenceEquals(_subscribedViewModel, viewModel))
+            {
+                return;
+            }
+
+            if (_subscribedViewModel != null)
+            {
+                _subscribedViewModel.PropertyChanged -= SubscribedViewModel_PropertyChanged;
+
+                _subscribedViewModel.AiDetectionEvents.CollectionChanged -= AiDetectionEvents_CollectionChanged;
+
+                _subscribedViewModel.FireDetectionEvents.CollectionChanged -= FireDetectionEvents_CollectionChanged;
+            }
+
+            _subscribedViewModel = viewModel;
+
+            if (_subscribedViewModel != null)
+            {
+                _hadActiveAiEvent = _subscribedViewModel.ActiveAiCount > 0;
+
+                _hadActiveFireEvent = _subscribedViewModel.ActiveFireCount > 0;
+
+                _subscribedViewModel.PropertyChanged += SubscribedViewModel_PropertyChanged;
+
+                _subscribedViewModel.AiDetectionEvents.CollectionChanged += AiDetectionEvents_CollectionChanged;
+
+                _subscribedViewModel.FireDetectionEvents.CollectionChanged += FireDetectionEvents_CollectionChanged;
+            }
+            else
+            {
+                _hadActiveAiEvent = false;
+                _hadActiveFireEvent = false;
+            }
+        }
+
+        /// <summary>
+        /// Active 개수가 이미 1 이상인 상태에서도 새 BBox 이벤트가 추가되면
+        /// 실제 이벤트 종류의 하위 탭으로 즉시 전환한다.
+        /// </summary>
+        private void AiDetectionEvents_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        {
+            // 2026-09-17: 하이브리드 이벤트마다 탭을 강제로 전환하면 UI가 깜빡이므로
+            // 패널을 여는 시점의 최신 이벤트 선택만 유지한다.
+        }
+
+        /// <summary>
+        /// 탐지 목록 변경에 따른 화면 선택과 요약을 갱신한다.
+        /// </summary>
+        private void FireDetectionEvents_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        {
+            // 2026-09-17: 빈번한 자동 탭 전환 방지.
+        }
+
+        /// <summary>
+        /// 이벤트 화면과 관련된 ViewModel 속성 변경을 반영한다.
+        /// </summary>
+        private void SubscribedViewModel_PropertyChanged(object sender, PropertyChangedEventArgs e)
+        {
+            MainViewModel viewModel = sender as MainViewModel;
+
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            if (e.PropertyName == nameof(MainViewModel.ActiveAiCount))
+            {
+                bool hasActiveAiEvent = viewModel.ActiveAiCount > 0;
+
+                _hadActiveAiEvent = hasActiveAiEvent;
+            }
+            else if (e.PropertyName == nameof(MainViewModel.ActiveFireCount))
+            {
+                bool hasActiveFireEvent = viewModel.ActiveFireCount > 0;
+
+                _hadActiveFireEvent = hasActiveFireEvent;
+            }
+        }
+
+        /// <summary>
+        /// 현재 이벤트 종류와 일치하도록 하위 탭 선택을 적용한다.
+        /// </summary>
+        private void ApplyEventTabSelection(int tabIndex, string reason)
+        {
+            try
+            {
+                MainViewModel viewModel = DataContext as MainViewModel;
+
+                if (viewModel == null || EventTypeTabControl == null || tabIndex < 0)
+                {
+                    ConsoleLogHelper.Warning("EVENT UI", "Event tab auto-selection skipped / ViewModel, TabControl, or index is unavailable");
+
+                    return;
+                }
+
+                int resolvedIndex = tabIndex == 1 ? 1 : 0;
+
+                viewModel.SelectedEventAlertTabIndex = resolvedIndex;
+
+                EventTypeTabControl.SetCurrentValue(TabControl.SelectedIndexProperty, resolvedIndex);
+
+                ConsoleLogHelper.Info("EVENT UI", "Event alert sub-tab selected / REASON=" + reason + " / TYPE=" + (resolvedIndex == 1 ? "FIRE DETECTION" : "AI DETECTION"));
+            }
+            catch (Exception exception)
+            {
+                ConsoleLogHelper.Error("EVENT UI", "Event tab auto-selection failed / " + exception.Message);
+            }
+        }
+
+        /// <summary>
+        /// 2026-08-24: 상위 이벤트 알림 탭 진입 시 가장 최근 이벤트 종류를 즉시 표시한다.
+        /// WPF TabControl이 보존한 이전 로컬 선택 상태보다 ViewModel 최신 이벤트 상태를 우선한다.
+        /// </summary>
+        public void SelectLatestEventTab()
+        {
+            try
+            {
+                MainViewModel viewModel = DataContext as MainViewModel;
+
+                if (viewModel == null || EventTypeTabControl == null)
+                {
+                    ConsoleLogHelper.Warning("EVENT UI", "Event tab selection skipped / ViewModel or TabControl is unavailable");
+
+                    return;
+                }
+
+                // 2026-08-24: 저장된 인덱스만 신뢰하지 않고 실제 목록의 최신 시각을
+                // 비교한다. 테스트 프로그램 FIRE 이벤트도 항상 FIRE 탭으로 연결된다.
+                DateTime? latestAiTime = viewModel.AiDetectionEvents.Count > 0 ? viewModel.AiDetectionEvents.Max(item => item.DetectedTime) : (DateTime?)null;
+
+                DateTime? latestFireTime = viewModel.FireDetectionEvents.Count > 0 ? viewModel.FireDetectionEvents.Max(item => item.DetectedTime) : (DateTime?)null;
+
+                int resolvedIndex = latestFireTime.HasValue && (!latestAiTime.HasValue || latestFireTime.Value >= latestAiTime.Value) ? 1 : latestAiTime.HasValue ? 0 : viewModel.SelectedEventAlertTabIndex;
+
+                ApplyEventTabSelection(resolvedIndex, "EVENT PANEL OPEN");
+
+                ConsoleLogHelper.Info("EVENT UI", "Event alert tab opened / TYPE=" + (resolvedIndex == 1 ? "FIRE DETECTION" : "AI DETECTION") + " / AI_COUNT=" + viewModel.AiDetectionEvents.Count + " / FIRE_COUNT=" + viewModel.FireDetectionEvents.Count);
+            }
+            catch (Exception exception)
+            {
+                ConsoleLogHelper.Error("EVENT UI", "Event tab selection failed / " + exception.Message);
+            }
+        }
+
+        /// <summary>
+        /// AI 이벤트의 이전 페이지로 이동한다.
+        /// </summary>
+        private void AiPreviousButton_Click(object sender, RoutedEventArgs e)
+        {
+            _aiPager?.MovePage(-1);
+        }
+
+        /// <summary>
+        /// AI 이벤트의 다음 페이지로 이동한다.
+        /// </summary>
+        private void AiNextButton_Click(object sender, RoutedEventArgs e)
+        {
+            _aiPager?.MovePage(1);
+        }
+
+        /// <summary>
+        /// 화재 및 연기 이벤트의 이전 페이지로 이동한다.
+        /// </summary>
+        private void FirePreviousButton_Click(object sender, RoutedEventArgs e)
+        {
+            _firePager?.MovePage(-1);
+        }
+
+        /// <summary>
+        /// 화재 및 연기 이벤트의 다음 페이지로 이동한다.
+        /// </summary>
+        private void FireNextButton_Click(object sender, RoutedEventArgs e)
+        {
+            _firePager?.MovePage(1);
+        }
+
+        /// <summary>
+        /// 2026-08-28: 페이지 버튼에 초점이 있으면 좌·우 방향키로
+        /// AI 또는 FIRE/SMOKE 목록을 같은 방식으로 순환 이동한다.
+        /// </summary>
+        private void EventPageButton_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Left && e.Key != Key.Right)
+            {
+                return;
+            }
+
+            try
+            {
+                bool isAiPage = ReferenceEquals(sender, AiPreviousButton) || ReferenceEquals(sender, AiNextButton);
+
+                EventPageController pager = isAiPage ? _aiPager : _firePager;
+
+                int direction = e.Key == Key.Left ? -1 : 1;
+
+                pager?.MovePage(direction);
+
+                e.Handled = true;
+
+                ConsoleLogHelper.Info("EVENT UI", "Keyboard page navigation / TYPE=" + (isAiPage ? "AI" : "FIRE_SMOKE") + " / DIRECTION=" + direction);
+            }
+            catch (Exception exception)
+            {
+                e.Handled = true;
+
+                ConsoleLogHelper.Error("EVENT UI", "Keyboard page navigation failed / " + exception.Message);
+            }
+        }
+
+        /// <summary>
+        /// 선택된 AI 이벤트 행의 삭제를 요청한다.
+        /// </summary>
+        private void AiDeleteSelectedButton_Click(object sender, RoutedEventArgs e)
+        {
+            _aiPager?.DeleteSelected();
+        }
+
+        /// <summary>
+        /// 선택된 화재 및 연기 이벤트 행의 삭제를 요청한다.
+        /// </summary>
+        private void FireDeleteSelectedButton_Click(object sender, RoutedEventArgs e)
+        {
+            _firePager?.DeleteSelected();
+        }
+
+        /// <summary>
+        /// 선택 개수 표시를 현재 두 표에 동기화한다.
+        /// </summary>
+        private void EventGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            _aiPager?.UpdateStatus();
+
+            _firePager?.UpdateStatus();
+        }
+
+        /// <summary>
+        /// 2026-08-24: 열 머리글 클릭 시 전체 이벤트를 정렬한 뒤 페이지를 다시 구성한다.
+        /// 첫 클릭은 오름차순, 같은 열의 다음 클릭은 내림차순으로 전환한다.
+        /// </summary>
+        private void EventGrid_Sorting(object sender, DataGridSortingEventArgs e)
+        {
+            try
+            {
+                DataGrid grid = sender as DataGrid;
+
+                EventPageController pager = ReferenceEquals(grid, AiEventGrid) ? _aiPager : ReferenceEquals(grid, FireEventGrid) ? _firePager : null;
+
+                if (grid == null || pager == null || e.Column == null || string.IsNullOrWhiteSpace(e.Column.SortMemberPath))
+                {
+                    e.Handled = true;
+
+                    ConsoleLogHelper.Warning("EVENT UI", "Event sort skipped / Grid, pager, or sort key is unavailable");
+
+                    return;
+                }
+
+                ListSortDirection direction = e.Column.SortDirection == ListSortDirection.Ascending ? ListSortDirection.Descending : ListSortDirection.Ascending;
+
+                foreach (DataGridColumn column in grid.Columns)
+                {
+                    column.SortDirection = null;
+                }
+
+                e.Column.SortDirection = direction;
+
+                e.Handled = true;
+
+                pager.ApplySort(e.Column.SortMemberPath, direction);
+            }
+            catch (Exception exception)
+            {
+                e.Handled = true;
+
+                ConsoleLogHelper.Error("EVENT UI", "Event sort failed / " + exception.Message);
+            }
+        }
+
+        /// <summary>
+        /// 한 이벤트 표의 고정 페이지 이동과 선택 삭제 상태를 관리한다.
+        /// </summary>
+        private sealed class EventPageController
+        {
+            private const double DefaultHeaderHeight = 30.0;
+
+            private const int FixedPageSize = 22;
+
+            private const double MinimumRowHeight = 27.0;
+
+            private const double GridBottomReserve = 3.0;
+
+            private readonly DataGrid _grid;
+
+            private readonly TextBlock _totalText;
+
+            private readonly TextBlock _selectedText;
+
+            private readonly TextBlock _pageText;
+
+            private readonly RepeatButton _previousButton;
+
+            private readonly RepeatButton _nextButton;
+
+            private readonly IList _source;
+
+            private readonly ICollectionView _view;
+
+            private readonly DispatcherTimer _refreshTimer;
+
+            private readonly List<object> _orderedItems = new List<object>();
+
+            private int _pageIndex;
+
+            private int _pageSize = FixedPageSize;
+
+            private double _lastAvailableHeight = -1.0;
+
+            private ScrollContentPresenter _rowsViewport;
+
+            private EventRecordComparer _activeComparer = new EventRecordComparer("DetectedTime", ListSortDirection.Descending);
+
+            internal EventPageController(DataGrid grid, TextBlock totalText, TextBlock selectedText, TextBlock pageText, RepeatButton previousButton, RepeatButton nextButton)
+            {
+                _grid = grid ?? throw new ArgumentNullException(nameof(grid));
+
+                // 2026-10-16: 수직 이동은 페이지 제어가 담당한다. 숨은 논리 스크롤로
+                // 마지막 표시 행 아래에 빈 행이 추가로 나타나지 않도록 한다.
+                ScrollViewer.SetCanContentScroll(_grid, false);
+
+                _grid.EnableRowVirtualization = false; // 페이지당 최대 22행만 표시한다.
+
+                _grid.PreviewMouseWheel += (sender, args) => args.Handled = true;
+
+                _grid.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler((sender, args) =>
+                {
+                    if (args.VerticalOffset > 0 && args.OriginalSource is ScrollViewer viewer)
+                    {
+                        viewer.ScrollToVerticalOffset(0);
+                    }
+                }));
+
+                _totalText = totalText ?? throw new ArgumentNullException(nameof(totalText));
+
+                _selectedText = selectedText ?? throw new ArgumentNullException(nameof(selectedText));
+
+                _pageText = pageText ?? throw new ArgumentNullException(nameof(pageText));
+
+                _previousButton = previousButton ?? throw new ArgumentNullException(nameof(previousButton));
+
+                _nextButton = nextButton ?? throw new ArgumentNullException(nameof(nextButton));
+
+                _source = grid.ItemsSource as IList;
+
+                _view = CollectionViewSource.GetDefaultView(grid.ItemsSource);
+
+                _refreshTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(80), DispatcherPriority.Background, (sender, args) =>
+                {
+                    _refreshTimer.Stop();
+
+                    Refresh();
+                }, _grid.Dispatcher);
+
+                _refreshTimer.Stop();
+
+                if (_view != null)
+                {
+                    _view.Filter = IsVisibleOnCurrentPage;
+
+                    if (_view is ListCollectionView initialListView)
+                    {
+                        initialListView.CustomSort = _activeComparer;
+                    }
+                }
+
+                if (_source is INotifyCollectionChanged observableSource)
+                {
+                    observableSource.CollectionChanged += OnSourceCollectionChanged;
+                }
+
+                foreach (FireEventRecord item in _source?.Cast<FireEventRecord>() ?? Enumerable.Empty<FireEventRecord>())
+                {
+                    item.PropertyChanged += EventRecord_PropertyChanged;
+                }
+
+                _grid.SizeChanged += OnGridSizeChanged;
+
+                // 2026-10-15: 외부 패널 스크롤로 SizeChanged 이후에도 행 뷰포트 높이가 바뀔 수 있다.
+                _grid.LayoutUpdated += (sender, args) =>
+                {
+                    if (UpdatePageSize())
+                    {
+                        QueueRefresh();
+                    }
+                };
+
+                QueueRefresh();
+            }
+
+            /// <summary>
+            /// 2026-08-24: 원본 전체 목록에 정렬을 적용한 후 첫 페이지부터 다시 표시한다.
+            /// </summary>
+            internal void ApplySort(string sortMemberPath, ListSortDirection direction)
+            {
+                if (string.IsNullOrWhiteSpace(sortMemberPath))
+                {
+                    return;
+                }
+
+                _activeComparer = new EventRecordComparer(sortMemberPath, direction);
+
+                _pageIndex = 0;
+
+                RebuildOrderedItems();
+
+                if (_view is ListCollectionView listView)
+                {
+                    listView.CustomSort = _activeComparer;
+                }
+                else if (_view != null && _view.CanSort)
+                {
+                    _view.SortDescriptions.Clear();
+
+                    _view.SortDescriptions.Add(new SortDescription(sortMemberPath, direction));
+                }
+
+                ConsoleLogHelper.Info("EVENT UI", "Event list sorted / COLUMN=" + sortMemberPath + " / DIRECTION=" + direction + " / TOTAL=" + SourceCount);
+
+                Refresh();
+            }
+
+            /// <summary>
+            /// 유효한 범위 안에서 이벤트 페이지를 이동한다.
+            /// </summary>
+            internal void MovePage(int offset)
+            {
+                int pageCount = PageCount;
+
+                _pageIndex = ((_pageIndex + offset) % pageCount + pageCount) % pageCount;
+
+                ConsoleLogHelper.Info("EVENT UI", "Event page moved / PAGE=" + (_pageIndex + 1) + "/" + PageCount);
+
+                Refresh();
+            }
+
+            /// <summary>
+            /// 현재 선택된 이벤트 행을 해당 원본 목록에서 삭제한다.
+            /// </summary>
+            internal void DeleteSelected()
+            {
+                if (_source == null || _grid.SelectedItems.Count == 0)
+                {
+                    return;
+                }
+
+                int removedCount = 0;
+
+                foreach (object item in _grid.SelectedItems.Cast<object>().ToArray())
+                {
+                    if (_source.Contains(item))
+                    {
+                        _source.Remove(item);
+
+                        removedCount++;
+                    }
+                }
+
+                ConsoleLogHelper.Info("EVENT UI", "Selected event rows deleted / COUNT=" + removedCount);
+
+                Refresh();
+            }
+
+            /// <summary>
+            /// 현재 페이지와 전체 건수 및 선택 건수를 표시한다.
+            /// </summary>
+            internal void UpdateStatus()
+            {
+                _totalText.Text = SourceCount + " EVENTS";
+
+                _selectedText.Text = _grid.SelectedItems.Count + " SELECTED";
+
+                _pageText.Text = (_pageIndex + 1) + " / " + PageCount;
+
+                bool canMove = PageCount > 1;
+
+                _previousButton.IsEnabled = canMove;
+
+                _nextButton.IsEnabled = canMove;
+            }
+
+            private int SourceCount
+            {
+                get
+                {
+                    return _source?.Count ?? 0;
+                }
+            }
+
+            private int PageCount
+            {
+                get
+                {
+                    return Math.Max(1, (int)Math.Ceiling(SourceCount / (double)Math.Max(1, _pageSize)));
+                }
+            }
+
+            /// <summary>
+            /// 지정 이벤트가 현재 표시 페이지에 속하는지 확인한다.
+            /// </summary>
+            private bool IsVisibleOnCurrentPage(object item)
+            {
+                if (_source == null || item == null)
+                {
+                    return false;
+                }
+
+                int index = _orderedItems.IndexOf(item);
+
+                int firstIndex = _pageIndex * _pageSize;
+
+                return index >= firstIndex && index < firstIndex + _pageSize;
+            }
+
+            /// <summary>
+            /// 2026-08-24: 필터가 현재 페이지만 고르도록 전체 정렬 순서의 스냅샷을 갱신한다.
+            /// </summary>
+            private void RebuildOrderedItems()
+            {
+                _orderedItems.Clear();
+
+                if (_source == null)
+                {
+                    return;
+                }
+
+                _orderedItems.AddRange(_source.Cast<object>());
+
+                if (_activeComparer != null)
+                {
+                    _orderedItems.Sort(_activeComparer);
+                }
+
+                // 현재 화면에 실제로 들어가는 페이지 크기를 기준으로 행 번호를 매긴다.
+                for (int index = 0; index < _orderedItems.Count; index++)
+                {
+                    if (_orderedItems[index] is FireEventRecord eventRecord)
+                    {
+                        eventRecord.DisplayIndex = (index % _pageSize) + 1;
+                    }
+                }
+            }
+
+            /// <summary>
+            /// 실제 표 높이에 들어가는 행 수만 한 페이지에 표시한다.
+            /// 최소 행 높이를 침범하면 마지막 행이 보더 아래로 잘리므로
+            /// 작은 화면에서는 페이지 크기를 줄여 스크롤 없이 표시한다.
+            /// </summary>
+            private bool UpdatePageSize()
+            {
+                double headerHeight = IsFinitePositive(_grid.ColumnHeaderHeight) ? _grid.ColumnHeaderHeight : DefaultHeaderHeight;
+
+                var viewport = _rowsViewport ?? (_rowsViewport = FindRowsViewport(_grid));
+
+                double availableHeight = Math.Max(0.0, (viewport != null && viewport.ActualHeight > 0 ? viewport.ActualHeight : _grid.ActualHeight - headerHeight) - GridBottomReserve);
+
+                if (availableHeight <= 0.0)
+                {
+                    return false;
+                }
+
+                int fittingPageSize = Math.Max(1, Math.Min(FixedPageSize, (int)Math.Floor(availableHeight / MinimumRowHeight)));
+
+                double fittedHeight = Math.Max(MinimumRowHeight, availableHeight / fittingPageSize);
+
+                if (Math.Abs(_grid.RowHeight - fittedHeight) > .01 || double.IsNaN(_grid.RowHeight))
+                {
+                    _grid.RowHeight = fittedHeight;
+                }
+
+                bool layoutChanged = Math.Abs(_lastAvailableHeight - availableHeight) >= 1.0;
+
+                _lastAvailableHeight = availableHeight;
+
+                if (_pageSize == fittingPageSize)
+                {
+                    if (layoutChanged)
+                    {
+                        ConsoleLogHelper.State("EVENT UI", "Fitting event page capacity retained / ROWS=" + _pageSize + " / HEIGHT=" + _grid.ActualHeight.ToString("F0"));
+                    }
+
+                    return false;
+                }
+
+                _pageSize = fittingPageSize;
+
+                _pageIndex = Math.Max(0, Math.Min(PageCount - 1, _pageIndex));
+
+                ConsoleLogHelper.State("EVENT UI", "Fitting event page capacity updated / ROWS=" + _pageSize + " / HEIGHT=" + _grid.ActualHeight.ToString("F0"));
+
+                return true;
+            }
+
+            /// <summary>
+            /// 목록 표시 크기 변경에 맞춰 페이지 구성을 다시 계산한다.
+            /// </summary>
+            private void OnGridSizeChanged(object sender, SizeChangedEventArgs e)
+            {
+                if (UpdatePageSize())
+                {
+                    QueueRefresh();
+                }
+            }
+
+            /// <summary>
+            /// 행이 실제로 표시되는 내부 뷰포트를 찾는다.
+            /// </summary>
+            private static ScrollContentPresenter FindRowsViewport(DependencyObject root)
+            {
+                if (root is ScrollContentPresenter presenter)
+                {
+                    return presenter;
+                }
+
+                for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+                {
+                    var found = FindRowsViewport(VisualTreeHelper.GetChild(root, i));
+
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                }
+
+                return null;
+            }
+
+            /// <summary>
+            /// 원본 목록 변경을 반영하고 페이지 갱신을 예약한다.
+            /// </summary>
+            private void OnSourceCollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+            {
+                if (e.OldItems != null)
+                {
+                    foreach (FireEventRecord item in e.OldItems.OfType<FireEventRecord>())
+                    {
+                        item.PropertyChanged -= EventRecord_PropertyChanged;
+                    }
+                }
+
+                if (e.NewItems != null)
+                {
+                    foreach (FireEventRecord item in e.NewItems.OfType<FireEventRecord>())
+                    {
+                        item.PropertyChanged += EventRecord_PropertyChanged;
+                    }
+                }
+
+                QueueRefresh();
+            }
+
+            /// <summary>
+            /// 행 상태 변경에 따른 정렬과 표시 갱신을 예약한다.
+            /// </summary>
+            private void EventRecord_PropertyChanged(object sender, PropertyChangedEventArgs e)
+            {
+                if (e.PropertyName == nameof(FireEventRecord.Status))
+                {
+                    QueueRefresh();
+                }
+            }
+
+            /// <summary>
+            /// 중복된 목록 갱신을 묶어 UI 스레드에 예약한다.
+            /// </summary>
+            private void QueueRefresh()
+            {
+                if (!_refreshTimer.IsEnabled)
+                {
+                    _refreshTimer.Start();
+                }
+            }
+
+            /// <summary>
+            /// 현재 상태와 표시 영역에 맞춰 화면을 갱신한다.
+            /// </summary>
+            private void Refresh()
+            {
+                UpdatePageSize();
+
+                RebuildOrderedItems();
+
+                _pageIndex = Math.Max(0, Math.Min(PageCount - 1, _pageIndex));
+
+                _view?.Refresh();
+
+                UpdateStatus();
+            }
+
+            /// <summary>
+            /// 표시 영역 계산에 사용할 값이 양의 유한수인지 확인한다.
+            /// </summary>
+            private static bool IsFinitePositive(double value)
+            {
+                return !double.IsNaN(value) && !double.IsInfinity(value) && value > 0.0;
+            }
+
+            /// <summary>
+            /// 이벤트 열별 데이터 형식에 맞춰 날짜, 숫자, 문자열을 비교한다.
+            /// </summary>
+            private sealed class EventRecordComparer : IComparer, IComparer<object>
+            {
+
+                #region [필드 및 상태 정보]
+                private readonly string _sortMemberPath;
+
+                private readonly int _directionFactor;
+
+                #endregion
+
+                #region [초기화]
+                internal EventRecordComparer(string sortMemberPath, ListSortDirection direction)
+                {
+                    _sortMemberPath = sortMemberPath;
+
+                    _directionFactor = direction == ListSortDirection.Ascending ? 1 : -1;
+                }
+
+                #endregion
+
+                #region [기능 처리 함수]
+
+                /// <summary>
+                /// 현재 정렬 기준에 따라 두 이벤트의 표시 순서를 비교한다.
+                /// </summary>
+                public int Compare(object left, object right)
+                {
+                    FireEventRecord leftEvent = left as FireEventRecord;
+
+                    FireEventRecord rightEvent = right as FireEventRecord;
+
+                    if (ReferenceEquals(leftEvent, rightEvent))
+                    {
+                        return 0;
+                    }
+
+                    if (leftEvent == null)
+                    {
+                        return -1 * _directionFactor;
+                    }
+
+                    if (rightEvent == null)
+                    {
+                        return 1 * _directionFactor;
+                    }
+
+                    int result;
+
+                    bool leftActive = string.Equals(leftEvent.Status, "ACTIVE", StringComparison.OrdinalIgnoreCase);
+
+                    bool rightActive = string.Equals(rightEvent.Status, "ACTIVE", StringComparison.OrdinalIgnoreCase);
+
+                    if (leftActive != rightActive)
+                    {
+                        if (leftActive)
+                        {
+                            return -1;
+                        }
+                        else
+                        {
+                            return 1;
+                        }
+                    }
+
+                    switch (_sortMemberPath)
+                    {
+                        case "DetectedTime":
+                            result = leftEvent.DetectedTime.CompareTo(rightEvent.DetectedTime);
+                            break;
+                        case "Camera":
+                            result = CompareText(leftEvent.Camera, rightEvent.Camera);
+                            break;
+                        case "DetectionType":
+                            result = CompareText(leftEvent.DetectionType, rightEvent.DetectionType);
+                            break;
+                        case "Confidence":
+                            result = ParseConfidence(leftEvent.Confidence).CompareTo(ParseConfidence(rightEvent.Confidence));
+                            break;
+                        case "PixelArea":
+                            result = leftEvent.PixelArea.CompareTo(rightEvent.PixelArea);
+                            break;
+                        case "Status":
+                            result = CompareText(leftEvent.Status, rightEvent.Status);
+                            break;
+                        default:
+                            result = leftEvent.EventId.CompareTo(rightEvent.EventId);
+                            break;
+                    }
+
+                    if (result == 0)
+                    {
+                        result = leftEvent.EventId.CompareTo(rightEvent.EventId);
+                    }
+
+                    return result * _directionFactor;
+                }
+
+                /// <summary>
+                /// 이벤트의 텍스트 정렬 값을 비교한다.
+                /// </summary>
+                private static int CompareText(string left, string right)
+                {
+                    return StringComparer.OrdinalIgnoreCase.Compare(left ?? string.Empty, right ?? string.Empty);
+                }
+
+                /// <summary>
+                /// 이벤트 신뢰도 문자열에서 정렬용 숫자를 읽는다.
+                /// </summary>
+                private static double ParseConfidence(string value)
+                {
+                    string normalized = (value ?? string.Empty).Trim().TrimEnd('%');
+
+                    if (double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out double result))
+                    {
+                        return result;
+                    }
+                    else
+                    {
+                        return double.MinValue;
+                    }
+                }
+                #endregion
+            }
+        }
+    }
+}

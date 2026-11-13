@@ -1,0 +1,2871 @@
+﻿using OpenCvWpfTracking.Common;
+using Microsoft.Win32;
+using OpenCvWpfTracking.ViewModels.Main;
+using OpenCvWpfTracking.Services.Video;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Threading;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Interop;
+using Serilog;
+
+namespace OpenCvWpfTracking
+{
+    /// <summary>
+    /// [MainWindow.xaml]에 대한 상호 작용 논리
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+
+        #region [공유 필드 및 시스템 연동 선언]
+
+        // 2026-09-16: MainWindow 전체화면은 작업영역(rcWork)이 아니라
+        // 현재 창이 위치한 모니터 전체 영역(rcMonitor)을 사용한다.
+        private const uint MonitorDefaultToNearest = 0x00000002;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRect
+        {
+            public int Left;
+
+            public int Top;
+
+            public int Right;
+
+            public int Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct NativeMonitorInfo
+        {
+            public int Size;
+
+            public NativeRect Monitor;
+
+            public NativeRect Work;
+
+            public uint Flags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr windowHandle, uint flags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern bool GetMonitorInfo(IntPtr monitorHandle, ref NativeMonitorInfo monitorInfo);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetDoubleClickTime();
+
+        internal static int VideoDoubleClickDelay
+        {
+            get
+            {
+                return (int)Math.Max(1u, GetDoubleClickTime());
+            }
+        }
+
+        private bool _isMainWindowFullScreen;
+
+        private Rect _mainWindowRestoreBounds;
+
+        private WindowState _mainWindowRestoreState;
+
+        private WindowStyle _mainWindowRestoreStyle;
+
+        private ResizeMode _mainWindowRestoreResizeMode;
+
+        private bool _mainWindowRestoreTopmost;
+
+        private double _mainWindowRestoreMaxWidth;
+
+        private double _mainWindowRestoreMaxHeight;
+
+        /// <summary>
+        /// [Main] 화면 -> [ViewModel]
+        ///
+        /// XAML Binding 및 화면 입력 이벤트를
+        /// MainViewModel로 전달한다.
+        /// </summary>
+        private readonly MainViewModel vm = new MainViewModel();
+
+        /// <summary>
+        /// EO 영상 분리 창.
+        ///
+        /// 동일 카메라 창이 중복으로 생성되지 않도록
+        /// 현재 열린 창 참조를 보관한다.
+        /// </summary>
+        private VideoPopoutWindow _eoVideoPopoutWindow;
+
+        /// <summary>
+        /// IR 영상 분리 창.
+        /// </summary>
+        private VideoPopoutWindow _irVideoPopoutWindow;
+
+        /// <summary>
+        /// 현재 메인 화면의 큰 영상으로 선택된 카메라.
+        /// </summary>
+        private VideoPopoutCameraType _primaryVideoType = VideoPopoutCameraType.Eo;
+
+        // 2026-09-29: 기존 더블클릭 분리 창 경로를 그대로 재사용하면서
+        // EO/IR 메인 영상의 의도적인 Drag도 분리 창 열기로 인식한다.
+        private bool _isVideoPopoutDragPending;
+
+        // 단일 클릭은 Windows의 두 번 클릭 판정 시간이 지난 뒤 실행한다.
+        // 두 번째 누름은 토큰을 갱신해 전체 화면·분리 동작이 팬·틸트를 송신하지 않게 한다.
+        private int _videoCenterClickGeneration;
+
+        private Point _videoPopoutDragStartPoint;
+
+        private VideoPopoutCameraType _videoPopoutDragCameraType;
+
+        private Rect _videoPopoutDragSourceBounds;
+
+        /// <summary>
+        /// 2026-09-30: 영상 영역 안에서 마우스를 누른 위치.
+        /// 분리 창으로 입력을 넘길 때 동일한 지점을 커서 아래에 유지한다.
+        /// </summary>
+        private Point _videoPopoutDragAnchor;
+
+        // 검출 시험 프로그램은 별도 실행 파일이므로 실행 프로세스를 보관한다.
+        // 뷰어 종료 시 함께 종료할 수 있도록 프로세스 수명을 관리한다.
+        private Process _fireDetectorTestProgram;
+
+        /// <summary>
+        /// 2026-08-18: EO 360도 촬영 프레임 합성 서비스와 취소 상태.
+        /// </summary>
+        private readonly EoPanoramaStitchingService _eoPanoramaStitchingService = new EoPanoramaStitchingService();
+
+        private CancellationTokenSource _panoramaCaptureCts;
+
+        private string _currentPanoramaFilePath;
+
+        private PanoramaPreviewWindow _panoramaPreviewWindow;
+
+        /// <summary>
+        /// GLOBAL SYSTEMS OpenStreetMap 확대 창.
+        /// 중복 생성되지 않도록 현재 열린 Window 참조를 보관한다.
+        /// </summary>
+        private CompanyMapWindow _companyMapWindow;
+
+        private bool _isWindowDragPending;
+
+        private Point _windowDragStartPoint;
+
+        // 2026-08-18: 분리 창을 열지 않아도 마우스가 올라간 EO/IR 화면을
+        // 대상으로 W/S/A/D 줌·포커스 연속 제어를 수행한다.
+        private Key? _activeHoverLensKey;
+
+        private VideoPopoutCameraType? _activeHoverLensCameraType;
+
+        // 2026-10-01: 제목 표시줄의 PC 로컬 시계는 화면 표시 전용이다.
+        // WebAgent 연결 상태와 무관하게 1초 간격으로 갱신하고 창 종료 시 해제한다.
+        private readonly DispatcherTimer _pcTitleBarClockTimer;
+
+        // 2026-10-01: 우측 상위/통신 하위 탭 Header를 마우스로 끌어
+        // 같은 TabControl 안에서 순서를 변경한다.
+        private Point _tabDragStartPoint;
+
+        private TabItem _draggedTabItem;
+
+        private TabControl _tabDragSource;
+
+        #endregion
+
+        #region [생성자]
+
+        /// <summary>
+        /// [Main] 화면 생성자
+        ///
+        /// ViewModel 생성 및 DataContext 연결
+        /// </summary>
+        public MainWindow()
+        {
+            InitializeComponent();
+
+            SourceInitialized += (s, e) =>
+            {
+                var source = HwndSource.FromHwnd(new WindowInteropHelper(this).Handle);
+
+                source?.AddHook(WindowResizeMessageHook);
+            };
+
+            ApplyDefaultCommunicationTabOrder();
+
+            DataContext = vm;
+
+            _pcTitleBarClockTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromSeconds(1)
+            };
+
+            _pcTitleBarClockTimer.Tick += PcTitleBarClockTimer_Tick;
+
+            UpdatePcTitleBarClock();
+
+            _pcTitleBarClockTimer.Start();
+
+            LayoutUpdated += AlignPcClockWithLogo;
+
+            _defaultPanoramaSource = PanoramaImage.Source;
+
+            InitializeDevicePanoramaFolders();
+
+            RestorePanoramaForCurrentDevice();
+
+            InitializePanoramaPresets();
+
+            // 파노라마 추가 화면은 보관하고 기존 파노라마 화면을 유지한다.
+        }
+
+        private void ApplyDefaultCommunicationTabOrder()
+        {
+            if (CommunicationSettingsTabControl == null)
+            {
+                return;
+            }
+
+            string[] defaultHeaders =
+            {
+                "CTRL / RTSP",
+                "SYSTEM TIME",
+                "POSITION",
+                "AI / VP SETTING"
+            };
+
+            Dictionary<string, TabItem> tabs = CommunicationSettingsTabControl.Items.OfType<TabItem>().Where(tab => tab.Header != null).ToDictionary(tab => tab.Header.ToString(), tab => tab, StringComparer.Ordinal);
+
+            if (defaultHeaders.Any(header => !tabs.ContainsKey(header)))
+            {
+                return;
+            }
+
+            foreach (string header in defaultHeaders)
+            {
+                CommunicationSettingsTabControl.Items.Remove(tabs[header]);
+            }
+
+            for (int index = 0; index < defaultHeaders.Length; index++)
+            {
+                CommunicationSettingsTabControl.Items.Insert(index, tabs[defaultHeaders[index]]);
+            }
+
+            CommunicationSettingsTabControl.SelectedIndex = 0;
+        }
+
+        private void ReorderableTabControl_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            TabControl tabControl = sender as TabControl;
+
+            TabItem tabItem = FindVisualAncestor<TabItem>(e.OriginalSource as DependencyObject);
+
+            if (tabControl == null || tabItem == null || !ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(tabItem), tabControl))
+            {
+                _draggedTabItem = null;
+                _tabDragSource = null;
+
+                return;
+            }
+
+            _tabDragStartPoint = e.GetPosition(tabControl);
+
+            _draggedTabItem = tabItem;
+            _tabDragSource = tabControl;
+        }
+
+        private void ReorderableTabControl_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            TabControl tabControl = sender as TabControl;
+
+            if (e.LeftButton != MouseButtonState.Pressed || _draggedTabItem == null || !ReferenceEquals(tabControl, _tabDragSource))
+            {
+                return;
+            }
+
+            Point current = e.GetPosition(tabControl);
+
+            if (Math.Abs(current.X - _tabDragStartPoint.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(current.Y - _tabDragStartPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
+            {
+                return;
+            }
+
+            TabItem dragged = _draggedTabItem;
+
+            dragged.Opacity = 0.62;
+
+            try
+            {
+                DragDrop.DoDragDrop(dragged, dragged, DragDropEffects.Move);
+            }
+            finally
+            {
+                dragged.Opacity = 1.0;
+
+                _draggedTabItem = null;
+                _tabDragSource = null;
+            }
+        }
+
+        private void ReorderableTabControl_Drop(object sender, DragEventArgs e)
+        {
+            TabControl tabControl = sender as TabControl;
+
+            TabItem dragged = e.Data.GetData(typeof(TabItem)) as TabItem;
+
+            TabItem target = FindVisualAncestor<TabItem>(e.OriginalSource as DependencyObject);
+
+            if (tabControl == null || dragged == null || !ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(dragged), tabControl) || target == null || !ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(target), tabControl) || ReferenceEquals(dragged, target))
+            {
+                return;
+            }
+
+            int targetIndex = tabControl.Items.IndexOf(target);
+
+            tabControl.Items.Remove(dragged);
+
+            tabControl.Items.Insert(targetIndex, dragged);
+
+            tabControl.SelectedItem = dragged;
+
+            e.Effects = DragDropEffects.Move;
+            e.Handled = true;
+        }
+
+        private static T FindVisualAncestor<T>(DependencyObject source)
+            where T : DependencyObject
+        {
+            DependencyObject current = source;
+
+            while (current != null)
+            {
+                if (current is T match)
+                {
+                    return match;
+                }
+
+                current = current is Visual ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current);
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 2026-10-01: 메인 제목 표시줄의 PC 로컬 시간을 초 단위로 갱신한다.
+        /// 매 Tick 로그는 기록하지 않아 불필요한 I/O를 방지한다.
+        /// </summary>
+        private void PcTitleBarClockTimer_Tick(object sender, EventArgs e)
+        {
+            UpdatePcTitleBarClock();
+        }
+
+        private void UpdatePcTitleBarClock()
+        {
+            if (PcTitleBarClockText == null)
+            {
+                return;
+            }
+
+            string clockText = "PC TIME  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+
+            if (PcTitleBarClockText.Text != clockText)
+            {
+                PcTitleBarClockText.Text = clockText;
+            }
+
+            if (PcTitleBarClockBadge != null)
+            {
+                PcTitleBarClockBadge.ToolTip = PcTitleBarClockText.Text;
+            }
+        }
+
+        private void AlignPcClockWithLogo(object sender, EventArgs e)
+        {
+            if (!IsLoaded || DeviceBrandLogo.ActualWidth <= 0 || TitleBarWindowButtons.ActualWidth <= 0)
+            {
+                return;
+            }
+
+            Point center = DeviceBrandLogo.TranslatePoint(new Point(DeviceBrandLogo.ActualWidth / 2, 0), TitleBarClockHost);
+
+            double buttonLeft = TitleBarWindowButtons.TranslatePoint(new Point(0, 0), TitleBarClockHost).X;
+
+            Rect placement = ClockBadgePlacement(center.X, buttonLeft);
+
+            double width = placement.Width, left = placement.X;
+
+            double titleWidth = Math.Max(1, left - 20);
+
+            if (Math.Abs(TitleBarProgramTitle.MaxWidth - titleWidth) > .1)
+            {
+                TitleBarProgramTitle.MaxWidth = titleWidth;
+            }
+
+            if (Math.Abs(PcTitleBarClockBadge.Width - width) > .1 || double.IsNaN(PcTitleBarClockBadge.Width))
+            {
+                PcTitleBarClockBadge.Width = width;
+            }
+
+            if (Math.Abs(PcTitleBarClockBadge.Margin.Left - left) > .1)
+            {
+                PcTitleBarClockBadge.Margin = new Thickness(left, 0, 0, 0);
+            }
+        }
+
+        private static Rect ClockBadgePlacement(double center, double buttonLeft)
+        {
+            // 시계 전체를 확대·축소해 한 픽셀 배지로 축소되는 현상을 피한다.
+            double width = Math.Max(1, Math.Min(210, Math.Max(110, 2 * (buttonLeft - center - 6))));
+
+            width = Math.Min(width, Math.Max(1, buttonLeft - 18));
+
+            double left = Math.Max(8, Math.Min(center - width / 2, buttonLeft - width - 6));
+
+            return new Rect(left, 0, width, 26);
+        }
+
+        /// <summary>
+        /// FireDetectorTestProgram_Click 이벤트 처리 함수.
+        /// </summary>
+        private FireSmokeZoneWindow _zoneWindow;
+
+        /// <summary>
+        /// LA 전환으로 SYNC 탭이 비활성화되면 표시 가능한 PTZF 탭으로 복귀한다.
+        /// </summary>
+        private void SyncOperationTab_IsEnabledChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (!(sender is TabItem syncTab) || syncTab.IsEnabled || !syncTab.IsSelected || !(DataContext is MainViewModel model) || model.IsEnvironmentStatusSelected)
+            {
+                return;
+            }
+
+            // 탭 순서를 바꾼 경우에도 표시 중인 PTZF 탭으로 복귀한다.
+            var tabs = ItemsControl.ItemsControlFromItemContainer(syncTab) as TabControl;
+
+            var ptzf = tabs?.Items.OfType<TabItem>().FirstOrDefault(tab => Equals(tab.Header, "PTZF"));
+
+            if (ptzf != null)
+            {
+                tabs.SelectedItem = ptzf;
+            }
+        }
+
+        /// <summary>
+        /// 선택 중인 프리셋 탭이 Agent 전환으로 숨겨지면 상대 Agent의 탭을 선택한다.
+        /// </summary>
+        private void PresetAgentTab_IsEnabledChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (!(sender is TabItem tab) || tab.IsEnabled || !tab.IsSelected)
+            {
+                return;
+            }
+
+            // 바인딩 갱신이 끝난 뒤 선택하여 숨겨진 콘텐츠나 빈 화면이 남지 않게 한다.
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (_isMainWindowClosing || !(DataContext is MainViewModel model))
+                {
+                    return;
+                }
+
+                var tabs = ItemsControl.ItemsControlFromItemContainer(tab) as TabControl;
+
+                var target = model.IsSelectedControlAgentWebAgent ? PresetWTab : PresetLTab;
+
+                if (tabs != null && target != null && target.IsEnabled)
+                {
+                    tabs.SelectedItem = target;
+                }
+            }));
+        }
+
+        private bool _isMainWindowClosing;
+
+        /// <summary>
+        /// 구역 설정창을 하나만 열고 닫기·X 종료 모두 같은 메인 화면 복귀 경로를 사용한다.
+        /// </summary>
+        private void FireSmokeZoneSettings_Click(object sender, RoutedEventArgs e)
+        {
+            if (!(DataContext is MainViewModel vm))
+            {
+                return;
+            }
+
+            try
+            {
+                if (_zoneWindow != null)
+                {
+                    if (_zoneWindow.WindowState == WindowState.Minimized)
+                    {
+                        _zoneWindow.WindowState = WindowState.Normal;
+                    }
+
+                    _zoneWindow.Activate();
+
+                    return;
+                }
+
+                WindowState returnState = WindowState == WindowState.Minimized ? WindowState.Normal : WindowState;
+
+                _zoneWindow = new FireSmokeZoneWindow(vm)
+                {
+                    Owner = this,
+                    ShowInTaskbar = false
+                };
+
+                _zoneWindow.Closed += (s, args) =>
+                {
+                    _zoneWindow = null;
+
+                    // 닫기와 제목 표시줄 X 모두 같은 메인 화면 복귀 경로를 사용한다.
+                    Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() => RestoreMainWindowAfterZoneClosed(returnState)));
+                };
+
+                _zoneWindow.Show();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, ex.Message, "FIRE / SMOKE 구역 설정", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>
+        /// 구역 설정창 종료 후 메인 창 상태를 복원하되 프로그램 종료 중에는 실행하지 않는다.
+        /// </summary>
+        private void RestoreMainWindowAfterZoneClosed(WindowState returnState)
+        {
+            // 프로그램 종료 중에는 구역 창이 닫혀도 메인 창을 다시 활성화하지 않는다.
+            if (_isMainWindowClosing || !IsVisible || Dispatcher.HasShutdownStarted)
+            {
+                return;
+            }
+
+            if (WindowState == WindowState.Minimized)
+            {
+                WindowState = returnState == WindowState.Maximized ? WindowState.Maximized : WindowState.Normal;
+            }
+
+            Activate();
+
+            Focus();
+        }
+
+        private void FireDetectorTestProgram_Click(object sender, RoutedEventArgs e)
+        {
+            string testProgramPath = ResolveFireDetectorTestProgramPath();
+
+            if (string.IsNullOrWhiteSpace(testProgramPath))
+            {
+                ConsoleLogHelper.Error("TEST PROGRAM", "FireCandidateValidator.exe was not found / BASE=" + AppDomain.CurrentDomain.BaseDirectory);
+
+                MessageBox.Show("Fire detector test program was not found. Rebuild the entire solution and run the Viewer from its output folder.", "TEST PROGRAM", MessageBoxButton.OK, MessageBoxImage.Warning);
+
+                return;
+            }
+
+            if (_fireDetectorTestProgram != null && !_fireDetectorTestProgram.HasExited)
+            {
+                _fireDetectorTestProgram.Refresh();
+
+                return;
+            }
+
+            try
+            {
+                ConsoleLogHelper.Command("TEST PROGRAM", "Starting FireCandidateValidator / PATH=" + testProgramPath);
+
+                _fireDetectorTestProgram = Process.Start(new ProcessStartInfo { FileName = testProgramPath, WorkingDirectory = Path.GetDirectoryName(testProgramPath), UseShellExecute = false });
+
+                _fireDetectorTestProgram.EnableRaisingEvents = true;
+
+                _fireDetectorTestProgram.Exited += (s, args) => Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    _fireDetectorTestProgram = null;
+                }));
+            }
+            catch (Exception ex)
+            {
+                _fireDetectorTestProgram = null;
+
+                MessageBox.Show("Could not start the fire detector test program.\n" + ex.Message, "TEST PROGRAM", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        // 2026-08-31: 일반 배치 위치를 우선 사용하고, Visual Studio에서 프로젝트별
+        // 출력 폴더만 생성된 경우에도 동일 Configuration의 Validator를 찾는다.
+        private static string ResolveFireDetectorTestProgramPath()
+        {
+            string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+
+            string directPath = Path.Combine(baseDirectory, "FireCandidateValidator.exe");
+
+            if (File.Exists(directPath))
+            {
+                return directPath;
+            }
+
+            string nestedPath = Path.Combine(baseDirectory, "FireCandidateValidator", "FireCandidateValidator.exe");
+
+            if (File.Exists(nestedPath))
+            {
+                return nestedPath;
+            }
+
+            DirectoryInfo configurationDirectory = new DirectoryInfo(baseDirectory);
+
+            DirectoryInfo platformDirectory = configurationDirectory.Parent;
+
+            DirectoryInfo binDirectory = platformDirectory?.Parent;
+
+            DirectoryInfo projectDirectory = binDirectory?.Parent;
+
+            if (projectDirectory == null || platformDirectory == null)
+            {
+                return null;
+            }
+
+            string projectOutputPath = Path.Combine(projectDirectory.FullName, "FireCandidateValidator", "bin", platformDirectory.Name, configurationDirectory.Name, "FireCandidateValidator.exe");
+
+            if (File.Exists(projectOutputPath))
+            {
+                return projectOutputPath;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// OnClosed 상태 및 이벤트 처리 함수.
+        /// </summary>
+        protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            base.OnClosing(e);
+
+            _isMainWindowClosing = !e.Cancel;
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            vm?.CancelPanoramaPresets();
+
+            vm?.StopPrecisionMotion("프로그램 종료");
+
+            ShutdownControlInputUi();
+
+            /*
+             * 2026-08-26: Application.Current가 해제되기 전에 ViewModel의
+             * AI 수신, 이벤트 Timer와 영상 연결을 먼저 종료한다.
+             */
+            try
+            {
+                if (_pcTitleBarClockTimer != null)
+                {
+                    _pcTitleBarClockTimer.Stop();
+
+                    _pcTitleBarClockTimer.Tick -= PcTitleBarClockTimer_Tick;
+                }
+
+                _panoramaCaptureCts?.Cancel();
+
+                vm.ShutdownForApplicationExit();
+
+                if (_fireDetectorTestProgram != null && !_fireDetectorTestProgram.HasExited)
+                {
+                    _fireDetectorTestProgram.Kill();
+                }
+            }
+            catch (Exception ex)
+            {
+                ConsoleLogHelper.Error("APPLICATION / SHUTDOWN", "Main window cleanup failed", ex);
+            }
+
+            base.OnClosed(e);
+        }
+
+        #endregion
+
+        #region [회사 위치 지도 이벤트]
+
+        /// <summary>
+        /// 메인 화면 GLOBAL SYSTEMS 지도 더블클릭 처리.
+        ///
+        /// 메인 화면의 현재 지도 중심/Zoom을 그대로 넘겨
+        /// 별도 확대 Window에서 OpenStreetMap을 계속 탐색할 수 있게 한다.
+        /// </summary>
+        private void CompanyMap_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+        {
+            OpenStreetMapControl mapControl = sender as OpenStreetMapControl;
+
+            if (mapControl == null || !vm.IsContextPanelsVisible)
+            {
+                return;
+            }
+
+            if (_companyMapWindow != null)
+            {
+                if (_companyMapWindow.WindowState == WindowState.Minimized)
+                {
+                    _companyMapWindow.WindowState = WindowState.Normal;
+                }
+
+                _companyMapWindow.Activate();
+
+                Log.Information("[MAP] Expanded Map Window Activate");
+
+                e.Handled = true;
+
+                return;
+            }
+
+            _companyMapWindow = new CompanyMapWindow(mapControl.CenterLatitude, mapControl.CenterLongitude, Math.Max(mapControl.Zoom, 16));
+
+            _companyMapWindow.Owner = this;
+
+            _companyMapWindow.DefaultViewReset += (resetSender, resetArgs) => mapControl.ResetDefaultView();
+
+            _companyMapWindow.Closed += (closedSender, closedArgs) =>
+            {
+                _companyMapWindow = null;
+            };
+
+            _companyMapWindow.Show();
+
+            Log.Information("[MAP] Expanded Map Window Open / CENTER=({Latitude:F6}, {Longitude:F6}) / ZOOM={Zoom}", mapControl.CenterLatitude, mapControl.CenterLongitude, Math.Max(mapControl.Zoom, 16));
+
+            e.Handled = true;
+        }
+
+        #endregion
+
+        #region [분리 영상창 이벤트]
+
+        /// <summary>
+        /// EO 영상 영역 더블클릭 처리.
+        ///
+        /// 기존 RTSP 연결을 새로 생성하지 않고,
+        /// MainViewModel의 EOCameraImage Binding을 공유하는
+        /// EO 전용 분리 창을 연다.
+        /// </summary>
+        private void EoVideoBorder_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (InlineOpticalCalibration.IsActive(EoCameraImageView) || InlineOpticalCalibration.IsSettingsHit(EoCameraImageView, e.OriginalSource as DependencyObject))
+            {
+                _isVideoPopoutDragPending = false;
+                _isWindowDragPending = false;
+
+                return;
+            }
+
+            // 펼침 버튼을 포함한 모든 오버레이 제어가 자체 클릭을 받게 한다.
+            if (Ancestor<ButtonBase>(e.OriginalSource as DependencyObject) != null || Ancestor<Expander>(e.OriginalSource as DependencyObject) != null)
+            {
+                _isVideoPopoutDragPending = false;
+                _isWindowDragPending = false;
+
+                return;
+            }
+
+            // 2026-10-01: 화면 배치와 무관하게 사용자가 선택한 영상 채널을
+            // PT 줌 감쇄 기준으로 사용한다. EO가 서브 화면이어도 동일하다.
+            vm?.SetActivePanTiltZoomSource(false);
+
+            if (TryHandleFovValidationClick(false, e))
+            {
+                return;
+            }
+
+            if (e.ClickCount == 1)
+            {
+                BeginVideoPopoutDrag(VideoPopoutCameraType.Eo, sender as FrameworkElement, e);
+
+                return;
+            }
+
+            // 2026-09-29: 메인 영상 더블클릭 분리 기능은 제거한다.
+            // 분리 창은 EO/IR 영상을 실제로 끌어낸 경우에만 생성한다.
+            _videoCenterClickGeneration++;
+
+            _isVideoPopoutDragPending = false;
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// IR 영상 영역 더블클릭 처리.
+        /// </summary>
+        private void IrVideoBorder_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (InlineOpticalCalibration.IsActive(IrCameraImageView) || InlineOpticalCalibration.IsSettingsHit(IrCameraImageView, e.OriginalSource as DependencyObject))
+            {
+                _isVideoPopoutDragPending = false;
+                _isWindowDragPending = false;
+
+                return;
+            }
+
+            // 영상 분리 드래그 대신 단축키·조그 상호작용을 우선 유지한다.
+            if (Ancestor<ButtonBase>(e.OriginalSource as DependencyObject) != null || Ancestor<Expander>(e.OriginalSource as DependencyObject) != null)
+            {
+                _isVideoPopoutDragPending = false;
+                _isWindowDragPending = false;
+
+                return;
+            }
+
+            // 2026-10-01: IR이 메인/서브 어느 위치에 있어도 클릭 즉시 ACTIVE(IR)로 전환한다.
+            vm?.SetActivePanTiltZoomSource(true);
+
+            if (TryHandleFovValidationClick(true, e))
+            {
+                return;
+            }
+
+            if (e.ClickCount == 1)
+            {
+                BeginVideoPopoutDrag(VideoPopoutCameraType.Ir, sender as FrameworkElement, e);
+
+                return;
+            }
+
+            _videoCenterClickGeneration++;
+
+            _isVideoPopoutDragPending = false;
+
+            e.Handled = true;
+        }
+
+        private void BeginVideoPopoutDrag(VideoPopoutCameraType cameraType, FrameworkElement sourceElement, MouseButtonEventArgs e)
+        {
+            _isWindowDragPending = false;
+            _videoPopoutDragCameraType = cameraType;
+
+            _videoPopoutDragStartPoint = e.GetPosition(this);
+
+            _videoPopoutDragSourceBounds = GetVideoSourceScreenBounds(sourceElement);
+
+            _videoPopoutDragAnchor = GetVideoPopoutDragAnchor(sourceElement, e);
+
+            _isVideoPopoutDragPending = true;
+
+            // MainWindow의 DragMove가 뒤이어 시작되지 않도록 영상 Drag 입력을
+            // 영상 분리 기능에서 소비한다.
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// 2026-09-29: WPF 표준 Drag 거리 이상 이동했을 때만 분리 창을 연다.
+        /// 한 Drag당 한 번만 실행하며 기존 창이 있으면 생성 대신 복원·활성화한다.
+        /// </summary>
+        private void VideoBorder_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            if (!_isVideoPopoutDragPending || e.LeftButton != MouseButtonState.Pressed)
+            {
+                return;
+            }
+
+            Point currentPoint = e.GetPosition(this);
+
+            double horizontalDistance = Math.Abs(currentPoint.X - _videoPopoutDragStartPoint.X);
+
+            double verticalDistance = Math.Abs(currentPoint.Y - _videoPopoutDragStartPoint.Y);
+
+            if (horizontalDistance < SystemParameters.MinimumHorizontalDragDistance && verticalDistance < SystemParameters.MinimumVerticalDragDistance)
+            {
+                return;
+            }
+
+            _isVideoPopoutDragPending = false;
+
+            ShowVideoPopoutWindow(_videoPopoutDragCameraType, _videoPopoutDragSourceBounds, _videoPopoutDragAnchor, true);
+
+            Log.Information("[VIDEO POPOUT] Open by drag / CAMERA={CameraType} " + "SOURCE={Width:0.0}x{Height:0.0} " + "ANCHOR=({AnchorX:0.0},{AnchorY:0.0})", _videoPopoutDragCameraType, _videoPopoutDragSourceBounds.Width, _videoPopoutDragSourceBounds.Height, _videoPopoutDragAnchor.X, _videoPopoutDragAnchor.Y);
+
+            e.Handled = true;
+        }
+
+        private async void VideoBorder_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            // 분리 드래그가 아닌 클릭은 선택한 영상 지점을 중앙으로 이동한다.
+            bool click = _isVideoPopoutDragPending;
+
+            _isVideoPopoutDragPending = false;
+
+            if (!click || !vm.IsVideoClickCenterEnabled || _isFovValidationActive || e.ChangedButton != MouseButton.Left || e.ClickCount > 1)
+            {
+                return;
+            }
+
+            Point current = e.GetPosition(this);
+
+            if (Math.Abs(current.X - _videoPopoutDragStartPoint.X) >= SystemParameters.MinimumHorizontalDragDistance || Math.Abs(current.Y - _videoPopoutDragStartPoint.Y) >= SystemParameters.MinimumVerticalDragDistance)
+            {
+                return;
+            }
+
+            bool ir = _videoPopoutDragCameraType == VideoPopoutCameraType.Ir;
+
+            Image image = ir ? IrCameraImageView : EoCameraImageView;
+
+            Point pixel;
+
+            if (!TryGetFovSourcePixel(image, e.GetPosition(image), out pixel))
+            {
+                return;
+            }
+
+            var bitmap = image.Source as BitmapSource;
+
+            if (bitmap == null)
+            {
+                return;
+            }
+
+            e.Handled = true;
+
+            int generation = ++_videoCenterClickGeneration;
+
+            await Task.Delay(VideoDoubleClickDelay);
+
+            if (generation != _videoCenterClickGeneration || !vm.IsVideoClickCenterEnabled || InlineOpticalCalibration.IsActive(image))
+            {
+                return;
+            }
+
+            await vm.CenterVideoPointAsync(ir, 2 * pixel.X / bitmap.PixelWidth - 1, 2 * pixel.Y / bitmap.PixelHeight - 1, bitmap.PixelWidth / (double)bitmap.PixelHeight, bitmap.PixelWidth, bitmap.PixelHeight);
+        }
+
+        /// <summary>
+        /// EO 또는 IR 영상 분리 창을 표시한다.
+        ///
+        /// 이미 열려 있는 경우 새 창을 만들지 않고
+        /// 기존 창을 복원한 뒤 앞으로 가져온다.
+        /// </summary>
+        private void ShowVideoPopoutWindow(VideoPopoutCameraType cameraType, Rect sourceScreenBounds, Point dragAnchor, bool beginDrag)
+        {
+            VideoPopoutWindow currentWindow = cameraType == VideoPopoutCameraType.Eo ? _eoVideoPopoutWindow : _irVideoPopoutWindow;
+
+            if (currentWindow != null)
+            {
+                if (currentWindow.WindowState == WindowState.Minimized)
+                {
+                    currentWindow.WindowState = WindowState.Normal;
+                }
+
+                currentWindow.Activate();
+
+                currentWindow.Focus();
+
+                if (beginDrag)
+                {
+                    currentWindow.BeginTearOffDrag(sourceScreenBounds, dragAnchor);
+                }
+
+                return;
+            }
+
+            VideoPopoutWindow popoutWindow = new VideoPopoutWindow(vm, cameraType, GetViewportAspectRatio(EoVideoBorder, 940.0 / 650.0), GetViewportAspectRatio(IrVideoBorder, 440.0 / 365.0), EoRenderedVideoSurface, IrRenderedVideoSurface)
+            {
+                Owner = this
+            };
+
+            popoutWindow.ConfigureInitialPlacement(sourceScreenBounds, dragAnchor, beginDrag);
+
+            popoutWindow.Closed += (sender, args) =>
+            {
+                if (cameraType == VideoPopoutCameraType.Eo)
+                {
+                    _eoVideoPopoutWindow = null;
+                }
+                else
+                {
+                    _irVideoPopoutWindow = null;
+                }
+            };
+
+            if (cameraType == VideoPopoutCameraType.Eo)
+            {
+                _eoVideoPopoutWindow = popoutWindow;
+            }
+            else
+            {
+                _irVideoPopoutWindow = popoutWindow;
+            }
+
+            popoutWindow.Show();
+
+            popoutWindow.Activate();
+        }
+
+        /// <summary>
+        /// 메인 영상 영역의 화면 좌표와 현재 표시 크기를 DIP 단위로 반환한다.
+        /// 분리 창이 EO/IR 화면에서 그대로 떼어져 나온 듯한 크기로 시작하도록 사용한다.
+        /// </summary>
+        private static Rect GetVideoSourceScreenBounds(FrameworkElement sourceElement)
+        {
+            if (sourceElement == null || sourceElement.ActualWidth <= 0.0 || sourceElement.ActualHeight <= 0.0)
+            {
+                return Rect.Empty;
+            }
+
+            Point screenPoint = sourceElement.PointToScreen(new Point(0.0, 0.0));
+
+            PresentationSource presentationSource = PresentationSource.FromVisual(sourceElement);
+
+            if (presentationSource?.CompositionTarget != null)
+            {
+                screenPoint = presentationSource.CompositionTarget.TransformFromDevice.Transform(screenPoint);
+            }
+
+            return new Rect(screenPoint.X, screenPoint.Y, sourceElement.ActualWidth, sourceElement.ActualHeight);
+        }
+
+        /// <summary>
+        /// 2026-09-30: 메인 영상에서 누른 실제 위치를 분리 창 좌표로 전달한다.
+        /// 연결 여부와 관계없이 EO/IR 원본 뷰의 같은 지점이 커서 아래에 유지된다.
+        /// </summary>
+        private static Point GetVideoPopoutDragAnchor(FrameworkElement sourceElement, MouseButtonEventArgs e)
+        {
+            if (sourceElement == null)
+            {
+                return new Point(0.0, 0.0);
+            }
+
+            Point anchor = e.GetPosition(sourceElement);
+
+            return new Point(Math.Max(0.0, Math.Min(sourceElement.ActualWidth, anchor.X)), Math.Max(0.0, Math.Min(sourceElement.ActualHeight, anchor.Y)));
+        }
+
+        /// <summary>
+        /// 2026-09-30: 실제 메인 EO/IR 화면 영역의 종횡비를 분리 창에 전달한다.
+        /// 미연결 안내 이미지의 픽셀 비율은 실제 화면 배치와 다를 수 있으므로
+        /// 연결 여부와 관계없이 현재 레이아웃 크기를 최우선으로 사용한다.
+        /// </summary>
+        private static double GetViewportAspectRatio(FrameworkElement viewport, double fallbackAspectRatio)
+        {
+            if (viewport == null || viewport.ActualWidth <= 0.0 || viewport.ActualHeight <= 0.0)
+            {
+                return fallbackAspectRatio;
+            }
+
+            return viewport.ActualWidth / viewport.ActualHeight;
+        }
+
+        /// <summary>
+        /// EO 또는 IR 영상을 메인 화면의 큰 영상으로 선택한다.
+        ///
+        /// 영상 Decoder, RTSP 연결, BitmapSource는 변경하지 않는다.
+        ///
+        /// EO / IR 영상 Container의 위치, 높이와 정렬을 함께 교환하여
+        /// 선택한 영상이 큰 주화면 영역 전체에 배치되도록 한다.
+        ///
+        /// R:
+        /// EO  -> Grid.Column 0
+        /// IR  -> Grid.Column 1
+        ///
+        /// T:
+        /// IR  -> Grid.Column 0
+        /// EO  -> Grid.Column 1
+        /// </summary>
+        internal void SelectPrimaryVideo(VideoPopoutCameraType cameraType)
+        {
+            if (_primaryVideoType == cameraType)
+            {
+                return;
+            }
+
+            vm.ReleaseAllControlInputs("Main channel switch");
+
+            _primaryVideoType = cameraType;
+
+            bool isEoPrimary = cameraType == VideoPopoutCameraType.Eo;
+
+            // 2026-10-01: 현재 메인 영상의 EO/IR 줌값을 GUI PT 속도 감쇄
+            // 기준으로 사용한다. PT 명령은 기존 WebAgent/LA 경로를 유지한다.
+            vm.SetActivePanTiltZoomSource(!isEoPrimary);
+
+            ApplyPrimaryVideoLayout(EoVideoBorder, isEoPrimary);
+
+            ApplyPrimaryVideoLayout(IrVideoContainer, !isEoPrimary);
+
+            UpdateAuxiliaryIrAspectLayout();
+
+            Console.WriteLine();
+
+            Console.WriteLine("[VIDEO SWITCH] PRIMARY VIDEO : " + (isEoPrimary ? "EO" : "IR"));
+
+            ConsoleLogHelper.PrintLine();
+        }
+
+        /// <summary>
+        /// EO / IR 영상 Container를 주화면 또는 보조화면 규격으로 배치한다.
+        ///
+        /// 주화면:
+        /// - Grid.Column 0
+        /// - 영상 행의 전체 높이 사용
+        /// - 중앙 십자선과 AI Overlay가 주화면 중앙에 배치됨
+        ///
+        /// 보조화면:
+        /// - Grid.Column 1
+        /// - 기존 IR 보조화면 높이 365 유지
+        /// - 상단 정렬
+        ///
+        /// R / T 전환 시 위치만 바꾸면 IR의 고정 높이가 주화면에도 남아
+        /// 영상 아래에 빈 공간이 생기고 십자선 기준이 어긋나므로,
+        /// 높이와 정렬까지 동일한 시점에 함께 갱신한다.
+        /// </summary>
+        private static void ApplyPrimaryVideoLayout(FrameworkElement videoContainer, bool isPrimary)
+        {
+            Grid.SetColumn(videoContainer, isPrimary ? 0 : 1);
+
+            // 2026-08-26: R/T 왕복 시 행의 Stretch 값이 남아 파노라마/지도와 겹치지 않도록
+            // 각 슬롯의 검증된 높이를 매 전환마다 명시적으로 복원한다.
+            videoContainer.Height = isPrimary ? 522 : 345;
+
+            videoContainer.HorizontalAlignment = HorizontalAlignment.Stretch;
+            videoContainer.VerticalAlignment = VerticalAlignment.Top;
+
+            videoContainer.Margin = isPrimary ? new Thickness(5, 5, 10, 0) : new Thickness(0, 5, 10, 0);
+        }
+
+        #endregion
+
+        #region [창 제목 표시줄 이벤트]
+        private bool _isNativeWindowSizing;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativePoint
+        {
+            public int X;
+
+            public int Y;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out NativePoint point);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hwnd, out NativeRect rect);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ResizeWindowPosition
+        {
+            public IntPtr Window;
+
+            public IntPtr InsertAfter;
+
+            public int X;
+
+            public int Y;
+
+            public int Width;
+
+            public int Height;
+
+            public uint Flags;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool RedrawWindow(IntPtr hwnd, IntPtr updateRect, IntPtr updateRegion, uint flags);
+
+        // 서로 충돌하던 창 크기 조절 루프 대신 네이티브 적중 검사 경로 하나를 사용한다.
+        private IntPtr WindowResizeMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (message == 0x0231)
+            {
+                _isNativeWindowSizing = true;
+                _isWindowDragPending = false;
+            }
+
+            if (message == 0x0232)
+            {
+                _isNativeWindowSizing = false;
+                _isWindowDragPending = false;
+
+                RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero, 0x0185);
+
+                ConsoleLogHelper.State("WINDOW RESIZE", "종료 / 전체 화면 갱신");
+            }
+
+            // 다른 크기로 변경된 창에 이전 크기의 화면 표면을 복사하지 않는다.
+            // WPF·바탕화면 합성 렌더링을 유지하고 크기 조절 종료 시에만 전체 갱신한다.
+            if (message == 0x0046 && _isNativeWindowSizing && lParam != IntPtr.Zero)
+            {
+                var position = (ResizeWindowPosition)Marshal.PtrToStructure(lParam, typeof(ResizeWindowPosition));
+
+                if ((position.Flags & 0x0001) == 0)
+                {
+                    position.Flags |= 0x0100;
+
+                    Marshal.StructureToPtr(position, lParam, false);
+                }
+            }
+
+            if (message != 0x0084 || _isMainWindowFullScreen || WindowState != WindowState.Normal || (ResizeMode != ResizeMode.CanResize && ResizeMode != ResizeMode.CanResizeWithGrip))
+            {
+                return IntPtr.Zero;
+            }
+
+            NativeRect rect;
+
+            NativePoint point;
+
+            if (!GetWindowRect(hwnd, out rect) || !GetCursorPos(out point))
+            {
+                return IntPtr.Zero;
+            }
+
+            var target = HwndSource.FromHwnd(hwnd)?.CompositionTarget;
+
+            double sx = target?.TransformToDevice.M11 ?? 1, sy = target?.TransformToDevice.M22 ?? 1;
+
+            int hit = ResizeHit(new Rect(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top), new Point(point.X, point.Y), sx, sy);
+
+            if (hit == 0)
+            {
+                return IntPtr.Zero;
+            }
+
+            _isWindowDragPending = false;
+            handled = true;
+
+            return new IntPtr(hit);
+        }
+
+        private static int ResizeHit(Rect rect, Point p, double sx, double sy)
+        {
+            if (!rect.Contains(p))
+            {
+                return 0;
+            }
+
+            bool left = p.X < rect.Left + 8 * sx, right = p.X >= rect.Right - 8 * sx, top = p.Y < rect.Top + 8 * sy, bottom = p.Y >= rect.Bottom - 8 * sy;
+
+            if (p.X < rect.Left + 16 * sx && p.Y < rect.Top + 16 * sy)
+            {
+                return 13;
+            }
+
+            if (p.X >= rect.Right - 16 * sx && p.Y < rect.Top + 16 * sy)
+            {
+                return 14;
+            }
+
+            if (p.X < rect.Left + 16 * sx && p.Y >= rect.Bottom - 16 * sy)
+            {
+                return 16;
+            }
+
+            if (p.X >= rect.Right - 16 * sx && p.Y >= rect.Bottom - 16 * sy)
+            {
+                return 17;
+            }
+
+            if (left)
+            {
+                return 10;
+            }
+            else
+            {
+                if (right)
+                {
+                    return 11;
+                }
+                else
+                {
+                    return top ? 12 : bottom ? 15 : 0;
+                }
+            }
+        }
+
+        /// <summary>
+        /// WindowFrame_PreviewMouseLeftButtonDown 동작 수행 함수.
+        /// </summary>
+        private void WindowFrame_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (_isNativeWindowSizing || e.ClickCount != 1 || IsInteractiveWindowElement(e.OriginalSource as DependencyObject))
+            {
+                _isWindowDragPending = false;
+
+                return;
+            }
+
+            _windowDragStartPoint = e.GetPosition(this);
+
+            _isWindowDragPending = true;
+        }
+
+        /// <summary>
+        /// WindowFrame_PreviewMouseMove 동작 수행 함수.
+        /// </summary>
+        private void WindowFrame_PreviewMouseMove(object sender, MouseEventArgs e)
+        {
+            if (_isNativeWindowSizing || !_isWindowDragPending || e.LeftButton != MouseButtonState.Pressed)
+            {
+                return;
+            }
+
+            Point current = e.GetPosition(this);
+
+            if (Math.Abs(current.X - _windowDragStartPoint.X) < SystemParameters.MinimumHorizontalDragDistance && Math.Abs(current.Y - _windowDragStartPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
+            {
+                return;
+            }
+
+            _isWindowDragPending = false;
+
+            try
+            {
+                DragMove();
+            }
+            catch (InvalidOperationException)
+            {
+                // 미리 보기 이벤트와 창 이동 사이에 마우스 버튼 상태가 바뀔 수 있다.
+            }
+        }
+
+        /// <summary>
+        /// WindowFrame_PreviewMouseLeftButtonUp 동작 수행 함수.
+        /// </summary>
+        private void WindowFrame_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            _isWindowDragPending = false;
+
+            // 2026-09-28: 조그 버튼 내부뿐 아니라 창의 어느 위치에서 버튼을
+            // 해제하더라도 활성 Pan/Tilt 축별 STOP을 먼저 보장한다.
+            // Pan/Tilt가 활성 상태가 아니면 내부에서 즉시 반환하므로
+            // Zoom / Focus 해제 경로와 함께 호출해도 중복 패킷은 발생하지 않는다.
+            vm?.StopPanTiltContinuousMove();
+
+            vm?.StopContinuousMove();
+        }
+
+        /// <summary>
+        /// IsInteractiveWindowElement 상태 확인 함수.
+        /// </summary>
+        private static bool IsInteractiveWindowElement(DependencyObject source)
+        {
+            DependencyObject current = source;
+
+            while (current != null)
+            {
+                if (current is ButtonBase || current is TextBoxBase || current is Selector || current is RangeBase || current is ScrollViewer || current is PasswordBox)
+                {
+                    return true;
+                }
+
+                current = current is Visual ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Window_StateChanged 동작 수행 함수.
+        /// </summary>
+        private void Window_StateChanged(object sender, EventArgs e)
+        {
+            UpdateWindowChromeState();
+        }
+
+        /// <summary>
+        /// UpdateWindowChromeState 갱신 함수.
+        /// </summary>
+        private void UpdateWindowChromeState()
+        {
+            bool isMaximized = _isMainWindowFullScreen || WindowState == WindowState.Maximized;
+
+            MaximizeWindowGlyph.Visibility = isMaximized ? Visibility.Collapsed : Visibility.Visible;
+
+            RestoreWindowGlyph.Visibility = isMaximized ? Visibility.Visible : Visibility.Collapsed;
+
+            MaximizeRestoreWindowButton.ToolTip = isMaximized ? "이전 크기로 복원" : "최대화";
+
+            WindowFrameBorder.CornerRadius = isMaximized ? new CornerRadius(0) : new CornerRadius(8);
+        }
+
+        /// <summary>
+        /// 사용자 정의 Title Bar 마우스 입력 처리.
+        ///
+        /// 한 번 누른 상태로 이동하면 창을 이동하고,
+        /// 두 번 누르면 최대화 / 이전 크기를 전환한다.
+        /// </summary>
+        private void WindowTitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.Source is Button)
+            {
+                return;
+            }
+
+            if (e.ClickCount == 2)
+            {
+                ToggleWindowState();
+
+                return;
+            }
+
+            if (e.LeftButton == MouseButtonState.Pressed)
+            {
+                DragMove();
+            }
+        }
+
+        /// <summary>
+        /// 프로그램 창 최소화.
+        /// </summary>
+        private void MinimizeWindowButton_Click(object sender, RoutedEventArgs e)
+        {
+            WindowState = WindowState.Minimized;
+        }
+
+        /// <summary>
+        /// 2026-08-24: 상위 이벤트 알림 탭 선택 시 최신 AI/FIRE 이벤트 하위 탭을 즉시 연다.
+        /// 내부 TabControl의 SelectionChanged 버블링은 처리하지 않는다.
+        /// </summary>
+        private void RightPanelTabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            TabControl tabControl = sender as TabControl;
+
+            // 2026-08-24: OriginalSource는 클릭한 TabItem이 될 수 있으므로
+            // 실제 SelectionChanged 발생원(Source)으로 상위 TabControl을 판별한다.
+            TabItem selectedTab = tabControl?.SelectedItem as TabItem;
+
+            if (!ReferenceEquals(e.Source, sender) || selectedTab == null || !ReferenceEquals(selectedTab, EventAlertTab))
+            {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new Action(() => EventAlertPanel?.SelectLatestEventTab()), DispatcherPriority.DataBind);
+        }
+
+        /// <summary>
+        /// 2026-08-24: 이미 선택된 이벤트 알림 상위 탭을 다시 눌러도 최신 이벤트 종류를 연다.
+        /// </summary>
+        private void EventAlertTabItem_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            // 기존 중첩 탭의 수동 선택 동작을 유지한다.
+            if (!ReferenceEquals(FindVisualAncestor<TabItem>(e.OriginalSource as DependencyObject), sender))
+            {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new Action(() => EventAlertPanel?.SelectLatestEventTab()), DispatcherPriority.DataBind);
+        }
+
+        /// <summary>
+        /// 프로그램 창 최대화 / 이전 크기 전환.
+        /// </summary>
+        private void MaximizeRestoreWindowButton_Click(object sender, RoutedEventArgs e)
+        {
+            ToggleWindowState();
+        }
+
+        /// <summary>
+        /// 프로그램 종료 확인.
+        ///
+        /// 사용자가 확인을 선택한 경우에만 MainWindow를 종료한다.
+        /// </summary>
+        private void CloseWindowButton_Click(object sender, RoutedEventArgs e)
+        {
+            MessageBoxResult result = MessageBox.Show(this, "프로그램을 종료하시겠습니까?", "프로그램 종료", MessageBoxButton.OKCancel, MessageBoxImage.Question);
+
+            if (result == MessageBoxResult.OK)
+            {
+                Close();
+            }
+        }
+
+        /// <summary>
+        /// 현재 창 상태에 따라 최대화와 이전 크기를 전환한다.
+        /// </summary>
+        private void ToggleWindowState()
+        {
+            if (_isMainWindowFullScreen)
+            {
+                ExitMainWindowFullScreen();
+
+                return;
+            }
+
+            EnterMainWindowFullScreen();
+        }
+
+        /// <summary>
+        /// 2026-09-16: 현재 모니터의 물리 rcMonitor를 WPF DIP로 변환해
+        /// 작업표시줄까지 덮는 MainWindow 전체화면으로 전환한다.
+        /// </summary>
+        private void EnterMainWindowFullScreen()
+        {
+            try
+            {
+                WindowInteropHelper helper = new WindowInteropHelper(this);
+
+                IntPtr monitorHandle = MonitorFromWindow(helper.Handle, MonitorDefaultToNearest);
+
+                NativeMonitorInfo monitorInfo = new NativeMonitorInfo
+                {
+                    Size = Marshal.SizeOf(typeof(NativeMonitorInfo))
+                };
+
+                if (monitorHandle == IntPtr.Zero || !GetMonitorInfo(monitorHandle, ref monitorInfo))
+                {
+                    throw new InvalidOperationException("현재 모니터의 전체 영역을 조회할 수 없습니다.");
+                }
+
+                _mainWindowRestoreBounds = WindowState == WindowState.Normal ? new Rect(Left, Top, Width, Height) : RestoreBounds;
+
+                _mainWindowRestoreState = WindowState;
+                _mainWindowRestoreStyle = WindowStyle;
+                _mainWindowRestoreResizeMode = ResizeMode;
+                _mainWindowRestoreTopmost = Topmost;
+                _mainWindowRestoreMaxWidth = MaxWidth;
+                _mainWindowRestoreMaxHeight = MaxHeight;
+
+                PresentationSource presentationSource = PresentationSource.FromVisual(this);
+
+                Matrix fromDevice = presentationSource?.CompositionTarget != null ? presentationSource.CompositionTarget.TransformFromDevice : Matrix.Identity;
+
+                Point topLeft = fromDevice.Transform(new Point(monitorInfo.Monitor.Left, monitorInfo.Monitor.Top));
+
+                Point bottomRight = fromDevice.Transform(new Point(monitorInfo.Monitor.Right, monitorInfo.Monitor.Bottom));
+
+                _isMainWindowFullScreen = true;
+                WindowState = WindowState.Normal;
+                WindowStyle = WindowStyle.None;
+                ResizeMode = ResizeMode.NoResize;
+                MaxWidth = double.PositiveInfinity;
+                MaxHeight = double.PositiveInfinity;
+                Left = topLeft.X;
+                Top = topLeft.Y;
+
+                Width = Math.Max(1.0, bottomRight.X - topLeft.X);
+
+                Height = Math.Max(1.0, bottomRight.Y - topLeft.Y);
+
+                // Windows 작업 전환 기능을 계속 사용할 수 있게 한다.
+                Topmost = false;
+
+                UpdateWindowChromeState();
+
+                ConsoleLogHelper.Info("MAIN WINDOW", $"Full screen entered / LEFT={Left:F1} / TOP={Top:F1} / WIDTH={Width:F1} / HEIGHT={Height:F1}");
+            }
+            catch (Exception ex)
+            {
+                _isMainWindowFullScreen = false;
+
+                ConsoleLogHelper.Error("MAIN WINDOW", "Full screen enter failed", ex);
+            }
+        }
+
+        /// <summary>
+        /// 2026-09-16: 전체화면 진입 전 위치·크기·Chrome 제한을 복원한다.
+        /// </summary>
+        private void ExitMainWindowFullScreen()
+        {
+            if (!_isMainWindowFullScreen)
+            {
+                return;
+            }
+
+            try
+            {
+                _isMainWindowFullScreen = false;
+                Topmost = _mainWindowRestoreTopmost;
+                WindowStyle = _mainWindowRestoreStyle;
+                ResizeMode = _mainWindowRestoreResizeMode;
+                MaxWidth = _mainWindowRestoreMaxWidth;
+                MaxHeight = _mainWindowRestoreMaxHeight;
+                WindowState = WindowState.Normal;
+                Left = _mainWindowRestoreBounds.Left;
+                Top = _mainWindowRestoreBounds.Top;
+                Width = _mainWindowRestoreBounds.Width;
+                Height = _mainWindowRestoreBounds.Height;
+
+                if (_mainWindowRestoreState == WindowState.Maximized)
+                {
+                    WindowState = WindowState.Maximized;
+                }
+
+                UpdateWindowChromeState();
+
+                ConsoleLogHelper.Info("MAIN WINDOW", "Full screen exited / previous bounds restored");
+            }
+            catch (Exception ex)
+            {
+                ConsoleLogHelper.Error("MAIN WINDOW", "Full screen restore failed", ex);
+            }
+        }
+
+        #endregion
+
+        #region [창 키보드 이벤트]
+
+        /// <summary>
+        /// [MainWindow] Loaded 처리
+        ///
+        /// 방향키 입력을 Window에서 받을 수 있도록
+        /// 초기 Keyboard Focus를 MainWindow에 설정한다.
+        /// </summary>
+        private void Window_Loaded(object sender, RoutedEventArgs e)
+        {
+            InitializeControlInputUi();
+
+            FitWindowToWorkingArea();
+
+            UpdateWindowChromeState();
+
+            Keyboard.Focus(this);
+        }
+
+        /// <summary>
+        /// 2026-09-16: 1920 x 1080 고정 설계 창을 실제 작업영역에 맞춰
+        /// 하단이 화면 밖으로 잘리지 않도록 크기와 위치를 보정한다.
+        /// </summary>
+        private void FitWindowToWorkingArea()
+        {
+            Rect workArea = SystemParameters.WorkArea;
+
+            MaxWidth = Math.Max(MinWidth, workArea.Width);
+
+            MaxHeight = Math.Max(MinHeight, workArea.Height);
+
+            if (WindowState != WindowState.Normal)
+            {
+                return;
+            }
+
+            Width = Math.Min(Width, workArea.Width);
+
+            Height = Math.Min(Height, workArea.Height);
+
+            Left = workArea.Left + Math.Max(0, (workArea.Width - Width) / 2);
+
+            Top = workArea.Top + Math.Max(0, (workArea.Height - Height) / 2);
+        }
+
+        /// <summary>
+        /// 2026-08-18: ROOFTOP EO 카메라를 360도 자동 회전시키고,
+        /// 정지 위치별 프레임을 OpenCV Panorama Stitcher로 합성한다.
+        /// 촬영 중 다시 누르면 안전 취소를 요청한다.
+        /// </summary>
+        private async void NewPanoramaButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (_panoramaCaptureCts != null)
+            {
+                ConsoleLogHelper.Warning("EO PANORAMA / UI", "Operator requested capture cancellation");
+
+                _panoramaCaptureCts.Cancel();
+
+                vm.SetPanoramaCancellationState(true, false);
+
+                PanoramaFileNameText.Text = "360° PANORAMA / 촬영 취소 중...";
+
+                PanoramaLoadingText.Text = "촬영 취소 중...";
+
+                return;
+            }
+
+            string blockReason = vm.GetPanoramaCaptureBlockReason();
+
+            if (blockReason != null)
+            {
+                ConsoleLogHelper.Warning("EO PANORAMA / UI", "Start rejected / REASON=" + blockReason);
+
+                MessageBox.Show(this, blockReason, "360° 파노라마 촬영", MessageBoxButton.OK, MessageBoxImage.Information);
+
+                return;
+            }
+
+            MessageBoxResult confirmation = MessageBox.Show(this, "EO 카메라가 자동으로 360° 회전합니다.\n\n" + "- EO Zoom: 광각 0~100 / 1000 권장\n" + "- 촬영 중 다른 Pan/Tilt/Zoom 조작 금지\n" + "- 선택 범위: " + vm.SelectedPanoramaTiltRangeDegrees + "°\n" + "- Tilt Row: " + vm.SelectedPanoramaRowCount + "개\n" + "- 10° 간격, 총 " + vm.SelectedPanoramaTotalFrameCount + " Frame 촬영 후 자동 합성\n\n" + "촬영을 시작하시겠습니까?", "360° 파노라마 촬영", MessageBoxButton.YesNo, MessageBoxImage.Question);
+
+            if (confirmation != MessageBoxResult.Yes)
+            {
+                ConsoleLogHelper.Info("EO PANORAMA / UI", "Operator declined capture confirmation");
+
+                return;
+            }
+
+            ConsoleLogHelper.Info("EO PANORAMA / UI", "Operator confirmed 360-degree panorama capture");
+
+            ClosePanoramaPreview();
+
+            _panoramaCaptureCts = new CancellationTokenSource();
+
+            vm.SetPanoramaCancellationState(false, false);
+
+            vm.SetPanoramaCompletionState(false);
+
+            // 2026-08-18: 촬영부터 정합/블렌딩/저장 완료까지 제어 잠금 유지.
+            vm.SetPanoramaProcessingRunning(true);
+
+            NewPanoramaButton.Content = "촬영 중지";
+
+            LoadPanoramaImageButton.IsEnabled = false;
+
+            PanoramaLoadingText.Text = "촬영 중...";
+
+            PanoramaLoadingOverlay.Visibility = Visibility.Visible;
+
+            Progress<string> progress = new Progress<string>(message =>
+            {
+                PanoramaFileNameText.Text = message;
+
+                if (message.Contains("시작 위치 복귀"))
+                {
+                    PanoramaLoadingText.Text = _panoramaCaptureCts != null && _panoramaCaptureCts.IsCancellationRequested ? "촬영 취소 중... / 시작 위치 복귀 중..." : "시작 위치 복귀 중...";
+                }
+            });
+
+            try
+            {
+                IList<IList<BitmapSource>> frameRows = await vm.CaptureEoPanoramaFramesAsync(progress, _panoramaCaptureCts.Token);
+
+                ConsoleLogHelper.State("EO PANORAMA / UI", "Capture phase completed / ROWS=" + frameRows.Count + " / FRAMES=" + frameRows.Sum(row => row.Count));
+
+                PanoramaFileNameText.Text = "360° PANORAMA / 특징점 정합 및 블렌딩 중...";
+
+                PanoramaLoadingText.Text = "특징점 정합 및 블렌딩 중...";
+
+                NewPanoramaButton.Content = "합성 중...";
+                NewPanoramaButton.IsEnabled = false;
+
+                string outputPath = GetNextPanoramaOutputPath();
+
+                ConsoleLogHelper.Info("EO PANORAMA / UI", "Stitch phase dispatched / OUTPUT=" + outputPath);
+
+                BitmapSource panorama = await Task.Run(() => _eoPanoramaStitchingService.StitchRowsAndSave(frameRows, outputPath, vm.LastPanoramaCoordinates));
+
+                PanoramaImage.Source = panorama;
+
+                _displayedPanoramaDeviceContext = PanoramaImageDeviceContext;
+                _currentPanoramaFilePath = outputPath;
+
+                PanoramaEmptyText.Visibility = Visibility.Collapsed;
+
+                PanoramaFileNameText.Text = "ROOFTOP PANORAMA / " + Path.GetFileName(outputPath);
+
+                ConsoleLogHelper.State("EO PANORAMA / UI", "Panorama completed and displayed / OUTPUT=" + outputPath + " / SIZE=" + panorama.PixelWidth + "x" + panorama.PixelHeight);
+
+                // 2026-08-21: 완료 알림 확인 전까지 간결한 완료 상태를 함께 표시한다.
+                PanoramaLoadingText.Text = "파노라마 생성 완료";
+
+                // 2026-08-24: 정상 완료 알림 전 우측 상단 작업 상태도 완료 문구로 갱신한다.
+                vm.SetPanoramaCompletionState(true);
+
+                await Dispatcher.Yield(DispatcherPriority.Render);
+
+                ConsoleLogHelper.State("EO PANORAMA / UI", "Completion status displayed before confirmation dialog");
+
+                MessageBox.Show(this, "360° EO 파노라마 생성이 완료되었습니다.\n\n" + outputPath, "파노라마 완료", MessageBoxButton.OK, MessageBoxImage.Information);
+
+                PanoramaLoadingOverlay.Visibility = Visibility.Collapsed;
+            }
+            catch (OperationCanceledException)
+            {
+                vm.SetPanoramaCancellationState(true, true);
+
+                ConsoleLogHelper.Warning("EO PANORAMA / UI", "Panorama operation canceled");
+
+                PanoramaFileNameText.Text = "ROOFTOP PANORAMA / 촬영 취소 완료";
+
+                PanoramaLoadingText.Text = "촬영 취소 완료 / 시작 위치 복귀 완료";
+
+                ConsoleLogHelper.State("EO PANORAMA / UI", "Capture cancellation completed and start position restored");
+
+                MessageBox.Show(this, "파노라마 촬영을 취소했습니다.\n시작 위치로 복귀했습니다.", "촬영 취소", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                ConsoleLogHelper.Error("EO PANORAMA / UI", "Panorama operation failed", ex);
+
+                PanoramaFileNameText.Text = "ROOFTOP PANORAMA / 생성 실패";
+
+                MessageBox.Show(this, "360° 파노라마를 생성할 수 없습니다.\n\n" + ex.Message, "파노라마 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            finally
+            {
+                vm.SetPanoramaCancellationState(false, false);
+
+                vm.SetPanoramaCompletionState(false);
+
+                vm.SetPanoramaProcessingRunning(false);
+
+                _panoramaCaptureCts.Dispose();
+
+                _panoramaCaptureCts = null;
+
+                NewPanoramaButton.Content = "360° 파노라마 촬영";
+                NewPanoramaButton.IsEnabled = true;
+
+                LoadPanoramaImageButton.IsEnabled = true;
+
+                PanoramaLoadingOverlay.Visibility = Visibility.Collapsed;
+
+                ConsoleLogHelper.Info("EO PANORAMA / UI", "Panorama UI and control lock restored");
+            }
+        }
+
+        /// <summary>
+        /// 2026-08-18: 기존 파노라마 이미지 불러오기
+        /// </summary>
+        private void LoadPanoramaImageButton_Click(object sender, RoutedEventArgs e)
+        {
+            SelectAndLoadPanoramaImage();
+        }
+
+        /// <summary>
+        /// 정적 파노라마 파일을 선택하고 화면에 표시한다.
+        ///
+        /// BitmapCacheOption.OnLoad를 사용하여 파일 전체를 메모리에 읽은 뒤
+        /// 원본 파일 잠금을 해제한다. 따라서 이미지를 표시한 상태에서도
+        /// 외부 편집 프로그램에서 동일 파일을 수정하거나 교체할 수 있다.
+        /// </summary>
+        private void SelectAndLoadPanoramaImage()
+        {
+            string panoramaDirectory = GetPanoramaDirectory();
+
+            /*
+             * 2026-08-18: 촬영 결과가 저장되는 동일한 Panoramas 폴더에서
+             * 파일 선택 창을 시작한다. 폴더가 아직 없으면 먼저 생성한다.
+             */
+            Directory.CreateDirectory(panoramaDirectory);
+
+            OpenFileDialog dialog = new OpenFileDialog
+            {
+                Title = "파노라마 이미지 선택",
+                Filter = "Image Files (*.jpg;*.jpeg;*.png;*.bmp)|*.jpg;*.jpeg;*.png;*.bmp|All Files (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false,
+                InitialDirectory = panoramaDirectory,
+                RestoreDirectory = true
+            };
+
+            if (dialog.ShowDialog(this) != true)
+            {
+                return;
+            }
+
+            try
+            {
+                DisplayPanoramaFile(dialog.FileName, "Manual file selected");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "파노라마 이미지를 불러올 수 없습니다.\n\n" + ex.Message, "파노라마 이미지 오류", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        private ImageSource _defaultPanoramaSource;
+
+        private string _displayedPanoramaDeviceContext;
+
+        private string PanoramaImageDeviceContext
+        {
+            get { return vm.PanoramaPresetContext; }
+        }
+
+        /// <summary>
+        /// 장비 전환 시 해당 장비의 마지막 사진 또는 전용 폴더 사진만 복원한다.
+        /// 공용 폴더의 과거 사진은 좌표 JSON의 장비·파일 지문이 맞을 때만 자동 선택한다.
+        /// </summary>
+        private void RestorePanoramaForCurrentDevice()
+        {
+            _displayedPanoramaDeviceContext = PanoramaImageDeviceContext;
+
+            ClosePanoramaPreview();
+
+            PanoramaImage.Source = _defaultPanoramaSource;
+
+            _currentPanoramaFilePath = null;
+
+            PanoramaFileNameText.Text = "ROOFTOP PANORAMA / DEFAULT IMAGE";
+
+            string contextHash = vm.PanoramaPresetContextHash;
+
+            string remembered = PanoramaPresetRegistration.ReadAtomic<string>(PanoramaPresetRegistration.LastImagePath(contextHash));
+
+            if (!string.IsNullOrWhiteSpace(remembered) && File.Exists(remembered))
+            {
+                try
+                {
+                    DisplayPanoramaFile(remembered, "현재 장비의 마지막 파노라마 복원");
+
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    ConsoleLogHelper.Warning("PANORAMA STORAGE", "마지막 사진 복원 실패: " + ex.Message);
+                }
+            }
+
+            LoadLatestGeneratedPanoramaOrKeepDefault();
+        }
+
+        /// <summary>
+        /// 현재 장비 폴더의 최신 사진을 우선 선택하고 공용 과거 사진은 일치하는 JSON이 있을 때만 복원한다.
+        /// </summary>
+        private void LoadLatestGeneratedPanoramaOrKeepDefault()
+        {
+            try
+            {
+                string directory = GetPanoramaDirectory();
+
+                string latestPath = Directory.Exists(directory) ? Directory.EnumerateFiles(directory, "Panorama *.jpg", SearchOption.TopDirectoryOnly).Select(path => new { Path = path, Sequence = GetPanoramaSequence(path) }).Where(item => item.Sequence > 0).OrderByDescending(item => item.Sequence).Select(item => item.Path).FirstOrDefault() : null;
+
+                if (latestPath == null)
+                {
+                    string previousDirectory = PanoramaPresetRegistration.LegacyDeviceDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Panoramas"), vm.IsSelectedControlAgentWebAgent, vm.PanoramaDeviceKey, vm.SelectedControlAgentProfile?.DisplayName);
+
+                    if (Directory.Exists(previousDirectory))
+                    {
+                        latestPath = Directory.EnumerateFiles(previousDirectory, "Panorama *.jpg", SearchOption.TopDirectoryOnly).Where(path => GetPanoramaSequence(path) > 0).OrderByDescending(GetPanoramaSequence).FirstOrDefault();
+                    }
+                }
+
+                if (latestPath == null)
+                {
+                    string legacy = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Panoramas");
+
+                    string contextHash = vm.PanoramaPresetContextHash;
+
+                    if (Directory.Exists(legacy))
+                    {
+                        latestPath = Directory.EnumerateFiles(legacy, "Panorama *.jpg", SearchOption.TopDirectoryOnly).OrderByDescending(GetPanoramaSequence).FirstOrDefault(path =>
+                        {
+                            try
+                            {
+                                var data = PanoramaPresetRegistration.ReadAtomic<PanoramaCoordinateMetadata>(Path.ChangeExtension(path, ".json"));
+
+                                return data != null && data.ContextHash == contextHash && data.ImageHash == PanoramaPresetRegistration.FileIdentity(path);
+                            }
+                            catch (Exception)
+                            {
+                                // 근거가 없는 과거 사진은 보존하고 사용자가 직접 선택하게 한다.
+                                return false;
+                            }
+                        });
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(latestPath))
+                {
+                    ConsoleLogHelper.Info("EO PANORAMA / DEFAULT", "No generated Panorama N.jpg found; bundled default retained / DIRECTORY=" + directory);
+
+                    return;
+                }
+
+                DisplayPanoramaFile(latestPath, "Latest generated panorama loaded at startup");
+            }
+            catch (Exception ex)
+            {
+                _currentPanoramaFilePath = null;
+
+                ConsoleLogHelper.Warning("EO PANORAMA / DEFAULT", "Latest panorama load failed; bundled default retained / " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// DisplayPanoramaFile 화면 표시 함수.
+        /// </summary>
+        private void DisplayPanoramaFile(string filePath, string logOperation)
+        {
+            BitmapImage bitmap = new BitmapImage();
+
+            bitmap.BeginInit();
+
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+
+            bitmap.UriSource = new Uri(filePath, UriKind.Absolute);
+
+            bitmap.EndInit();
+
+            bitmap.Freeze();
+
+            PanoramaImage.Source = bitmap;
+
+            _displayedPanoramaDeviceContext = PanoramaImageDeviceContext;
+            _currentPanoramaFilePath = filePath;
+
+            PanoramaEmptyText.Visibility = Visibility.Collapsed;
+
+            PanoramaFileNameText.Text = "ROOFTOP PANORAMA / " + Path.GetFileName(filePath);
+
+            ConsoleLogHelper.State("EO PANORAMA / DEFAULT", logOperation + " / FILE=" + filePath + " / SIZE=" + bitmap.PixelWidth + "x" + bitmap.PixelHeight);
+        }
+
+        /// <summary>
+        /// GetPanoramaSequence 조회 함수.
+        /// </summary>
+        private static int GetPanoramaSequence(string filePath)
+        {
+            string fileName = Path.GetFileNameWithoutExtension(filePath);
+
+            const string Prefix = "Panorama ";
+
+            if (string.IsNullOrWhiteSpace(fileName) || !fileName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return -1;
+            }
+
+            if (int.TryParse(fileName.Substring(Prefix.Length), out int sequence))
+            {
+                return sequence;
+            }
+            else
+            {
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// PanoramaImage_MouseLeftButtonDown 동작 수행 함수.
+        /// </summary>
+        private void PanoramaImage_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.ClickCount != 2 || PanoramaImage.Source == null || !vm.IsContextPanelsVisible)
+            {
+                return;
+            }
+
+            if (vm.IsPanoramaCaptureRunning || vm.IsPanoramaProcessingRunning)
+            {
+                e.Handled = true;
+
+                ConsoleLogHelper.Warning("EO PANORAMA / PREVIEW", "Preview blocked while capture, stitching, blending or saving is running");
+
+                return;
+            }
+
+            if (_panoramaPreviewWindow != null)
+            {
+                if (_panoramaPreviewWindow.WindowState == WindowState.Minimized)
+                {
+                    _panoramaPreviewWindow.WindowState = WindowState.Normal;
+                }
+
+                _panoramaPreviewWindow.Activate();
+
+                e.Handled = true;
+
+                return;
+            }
+
+            e.Handled = true;
+
+            try
+            {
+                PanoramaPreviewWindow previewWindow = new PanoramaPreviewWindow(PanoramaImage.Source, _currentPanoramaFilePath, string.IsNullOrWhiteSpace(_currentPanoramaFilePath) ? "기본 파노라마" : Path.GetFileName(_currentPanoramaFilePath))
+                {
+                    Owner = this
+                };
+
+                _panoramaPreviewWindow = previewWindow;
+
+                DrawPanoramaPresetLinks();
+
+                previewWindow.Closed += (closedSender, closedArgs) =>
+                {
+                    if (ReferenceEquals(_panoramaPreviewWindow, previewWindow))
+                    {
+                        _panoramaPreviewWindow = null;
+                    }
+                };
+
+                previewWindow.Show();
+
+                ConsoleLogHelper.Info("EO PANORAMA / PREVIEW", "Panorama preview opened / FILE=" + (_currentPanoramaFilePath ?? "BUNDLED_DEFAULT"));
+            }
+            catch (Exception ex)
+            {
+                _panoramaPreviewWindow = null;
+
+                ConsoleLogHelper.Error("EO PANORAMA / PREVIEW", "Panorama preview open failed", ex);
+
+                MessageBox.Show(this, "파노라마 확대 창을 열 수 없습니다.\n\n" + ex.Message, "파노라마 확대 보기", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+
+        /// <summary>
+        /// ClosePanoramaPreview 종료 및 자원 해제 함수.
+        /// </summary>
+        private void ClosePanoramaPreview()
+        {
+            PanoramaPreviewWindow previewWindow = _panoramaPreviewWindow;
+
+            _panoramaPreviewWindow = null;
+
+            if (previewWindow == null)
+            {
+                return;
+            }
+
+            try
+            {
+                previewWindow.Close();
+
+                ConsoleLogHelper.Info("EO PANORAMA / PREVIEW", "Open preview closed before panorama processing");
+            }
+            catch (Exception ex)
+            {
+                ConsoleLogHelper.Error("EO PANORAMA / PREVIEW", "Failed to close preview before panorama processing", ex);
+            }
+        }
+
+        /// <summary>
+        /// 2026-08-18: 생성과 불러오기가 항상 동일한 저장 폴더를 사용한다.
+        /// Agent 종류와 장비 키별 하위 폴더를 사용하며 기존 공용 사진은 이동하지 않는다.
+        /// </summary>
+        /// <summary>등록된 모든 장비 폴더에 공통 기본 사진 0번을 준비한다. 실제 촬영은 1번부터 시작한다.</summary>
+        private void InitializeDevicePanoramaFolders()
+        {
+            int prepared = 0, attempted = 0;
+
+            foreach (var profile in vm.ControlAgentProfiles.Where(profile => !profile.IsDirectInput))
+            {
+                attempted++;
+
+                try
+                {
+                    string key = profile.DisplayName + "|" + profile.IpAddress + ":" + profile.Port;
+
+                    string directory = PanoramaPresetRegistration.DeviceDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Panoramas"), profile.AgentType == OpenCvWpfTracking.Models.Main.ControlAgentType.WebAgent, key, profile.DisplayName, profile.DeviceId);
+
+                    EnsurePanoramaDefault(directory);
+
+                    prepared++;
+                }
+                catch (Exception ex)
+                {
+                    ConsoleLogHelper.Warning("PANORAMA STORAGE", "장비 기본 사진 준비 실패: " + ex.Message);
+                }
+            }
+
+            ConsoleLogHelper.State("PANORAMA STORAGE", $"장비별 파노라마 경로·기본 사진 준비 / {prepared}/{attempted}개 확인");
+        }
+
+        /// <summary>기본 사진은 실행 파일에 포함된 같은 원본을 복사하며 기존 0번 파일은 덮어쓰지 않는다.</summary>
+        private static void EnsurePanoramaDefault(string directory)
+        {
+            string path = Path.Combine(directory, "Panorama 0.jpg");
+
+            if (File.Exists(path))
+            {
+                return;
+            }
+
+            var resource = Application.GetResourceStream(new Uri("/Images/Demo/DefaultRooftopPanorama.jpg", UriKind.Relative));
+
+            if (resource == null)
+            {
+                throw new FileNotFoundException("기본 파노라마 원본을 찾을 수 없습니다.");
+            }
+
+            using (var source = resource.Stream)
+            using (var destination = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+            {
+                source.CopyTo(destination);
+            }
+        }
+
+        private string GetPanoramaDirectory()
+        {
+            string directory = PanoramaPresetRegistration.DeviceDirectory(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Panoramas"), vm.IsSelectedControlAgentWebAgent, vm.PanoramaDeviceKey, vm.SelectedControlAgentProfile?.DisplayName, vm.SelectedControlAgentProfile?.DeviceId);
+
+            EnsurePanoramaDefault(directory);
+
+            return directory;
+        }
+
+        /// <summary>
+        /// 2026-08-18: 기존 결과를 덮어쓰지 않고 현재 가장 큰 번호 + 1로
+        /// 저장한다. 중간 번호가 삭제되어도 새 결과가 항상 최신 번호가 된다.
+        /// </summary>
+        private string GetNextPanoramaOutputPath()
+        {
+            string directory = GetPanoramaDirectory();
+
+            Directory.CreateDirectory(directory);
+
+            int sequence = Directory.EnumerateFiles(directory, "Panorama *.jpg", SearchOption.TopDirectoryOnly).Select(GetPanoramaSequence).Where(value => value > 0).DefaultIfEmpty(0).Max() + 1;
+
+            while (true)
+            {
+                string candidate = Path.Combine(directory, "Panorama " + sequence + ".jpg");
+
+                if (!File.Exists(candidate))
+                {
+                    return candidate;
+                }
+
+                sequence++;
+            }
+        }
+
+        /// <summary>
+        /// [Window] Keyboard KeyDown 처리
+        ///
+        /// R / T:
+        /// EO 또는 IR 영상을 큰 주화면으로 선택한다.
+        ///
+        /// 방향키:
+        /// Pan / Tilt 이동 상태를 ViewModel로 전달한다.
+        ///
+        /// TextBox 입력 중에는 단축키를 처리하지 않는다.
+        /// </summary>
+        private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            // 운영체제 조합키와 전역 키 후크를 중복 처리하지 않는다.
+            if (e.Key == Key.System || Keyboard.Modifiers != ModifierKeys.None)
+            {
+                vm.ReleaseControlOwner("main");
+
+                return;
+            }
+
+            if (!IsTextBoxKeyboardFocus() && !IsControlInputKeyboardLocked() && !IsEventPageNavigationKey(e.Key) && vm.HandleControlKey("main", e.Key, true, GetHoveredCameraType() == VideoPopoutCameraType.Ir, e.IsRepeat))
+            {
+                e.Handled = true;
+
+                return;
+            }
+
+            // 2026-09-16: ESC는 장비 제어 Lock보다 우선하여 메인 전체화면을 복원한다.
+            if (e.Key == Key.Escape && _isMainWindowFullScreen)
+            {
+                ExitMainWindowFullScreen();
+
+                e.Handled = true;
+
+                return;
+            }
+
+            // 2026-08-28: 이벤트 PREVIOUS/NEXT 버튼이 키보드 초점을 가진 경우
+            // 좌·우 키를 PTZ 명령으로 소비하지 않고 하위 이벤트 목록에 전달한다.
+            if (IsEventPageNavigationKey(e.Key))
+            {
+                return;
+            }
+
+            // HOME / ZERO 또는 AUTO SCAN 중에는 장비 제어 키 입력 전체를 차단한다.
+            //
+            // 차단 범위:
+            // - 방향키
+            // WASD 방향키 입력을 처리한다.
+            // - Zoom In / Zoom Out 단축키
+            // - Focus Near / Focus Far 단축키
+            // - R / T 영상 전환
+            // - 이후 추가되는 기타 Window 장비 제어 단축키
+            //
+            // 특정 키만 선별하지 않고 PreviewKeyDown 입구에서 먼저 반환하므로
+            // 잠금 진행 중 어떠한 키보드 제어도 장비 명령 함수까지 도달하지 않는다.
+            // 작업 완료/중지 후 IsControlInputLocked=false가 되면
+            // 별도 사용자 조작 없이 자동으로 정상 입력 상태로 복귀한다.
+            if (IsControlInputKeyboardLocked())
+            {
+                StopActiveHoverLensMove();
+
+                e.Handled = true;
+
+                return;
+            }
+
+            if (IsTextBoxKeyboardFocus())
+            {
+                return;
+            }
+
+            // R / T 영상 주화면 전환 처리
+            //
+            // KeyDown 자동 반복으로 동일 전환이 반복되지 않도록
+            // 최초 KeyDown에서만 처리한다.
+            //
+            if (IsVideoSwitchKey(e.Key))
+            {
+                if (!e.IsRepeat)
+                {
+                    VideoPopoutCameraType targetCameraType = e.Key == Key.R ? VideoPopoutCameraType.Eo : VideoPopoutCameraType.Ir;
+
+                    SelectPrimaryVideo(targetCameraType);
+                }
+
+                e.Handled = true;
+
+                return;
+            }
+
+            // 2026-08-18: 메인 화면의 EO/IR 영상 위에 마우스를 둔 상태에서는
+            // W/S=Zoom In/Out, A/D=Focus Near/Far로 해당 카메라를 제어한다.
+            if (IsLensShortcutKey(e.Key))
+            {
+                VideoPopoutCameraType? hoveredCamera = GetHoveredCameraType();
+
+                if (hoveredCamera.HasValue)
+                {
+                    if (!_activeHoverLensKey.HasValue && !e.IsRepeat)
+                    {
+                        _activeHoverLensKey = e.Key;
+                        _activeHoverLensCameraType = hoveredCamera.Value;
+
+                        StartHoverLensMove(hoveredCamera.Value, e.Key);
+                    }
+
+                    e.Handled = true;
+
+                    return;
+                }
+            }
+
+            if (!IsPanTiltDirectionKey(e.Key))
+            {
+                return;
+            }
+
+            // 2026-10-01: 메인/서브 배치가 아니라 현재 마우스가 위치한
+            // 영상 채널을 방향키 PT 감쇄 기준으로 사용한다.
+            if (EoVideoBorder?.IsMouseOver == true)
+            {
+                vm?.SetActivePanTiltZoomSource(false);
+            }
+            else if (IrVideoBorder?.IsMouseOver == true)
+            {
+                vm?.SetActivePanTiltZoomSource(true);
+            }
+
+            vm?.HandlePanTiltKeyDown(e.Key);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [Window] 방향키 KeyUp 처리
+        ///
+        /// 해제된 방향키 상태를 ViewModel로 전달하고,
+        /// 남아 있는 방향키 조합에 맞춰 이동 방향을 갱신한다.
+        ///
+        /// 예:
+        /// Left + Up 상태에서 Up만 해제
+        /// -> 대각선 이동에서 Pan Left 이동으로 전환
+        /// </summary>
+        private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
+        {
+            if (vm.HandleControlKey("main", e.Key, false, _primaryVideoType == VideoPopoutCameraType.Ir))
+            {
+                e.Handled = true;
+
+                return;
+            }
+
+            // HOME / ZERO 또는 AUTO SCAN 진행 중 KeyUp도 함께 소비한다.
+            //
+            // HOME 시작 전에 눌려 있던 방향키/WASD/Zoom/Focus 키가
+            // HOME 완료 뒤 늦게 해제되면서 Stop 또는 방향 전환 명령을
+            // 발생시키는 것을 방지한다.
+            if (IsControlInputKeyboardLocked())
+            {
+                StopActiveHoverLensMove();
+
+                e.Handled = true;
+
+                return;
+            }
+
+            if (_activeHoverLensKey.HasValue && _activeHoverLensKey.Value == e.Key)
+            {
+                StopActiveHoverLensMove();
+
+                e.Handled = true;
+
+                return;
+            }
+
+            if (!IsPanTiltDirectionKey(e.Key))
+            {
+                return;
+            }
+
+            vm?.HandlePanTiltKeyUp(e.Key);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [Window] Focus 이탈 처리
+        ///
+        /// 방향키를 누른 상태에서 다른 프로그램으로 전환되면
+        /// KeyUp 이벤트가 들어오지 않을 수 있으므로,
+        /// 키보드 Pan / Tilt 상태를 강제로 초기화하고 정지한다.
+        /// </summary>
+        private void Window_Deactivated(object sender, EventArgs e)
+        {
+            vm?.StopPrecisionMotion("창 포커스 이탈");
+
+            if (vm.IsGlobalControlEnabled)
+            {
+                vm.ReleaseControlOwner("main");
+
+                vm.ReleaseControlOwner("mouse");
+
+                vm.ReleaseControlOwner("video");
+
+                return;
+            }
+
+            vm.ReleaseAllControlInputs("Window deactivated");
+
+            StopActiveHoverLensMove();
+
+            vm?.ResetAllKeyboardControlState();
+        }
+
+        /// <summary>
+        /// 2026-08-18: 제어 중 마우스가 EO/IR 영상 밖으로 나가면 KeyUp 유실과
+        /// 관계없이 줌·포커스 연속 명령을 즉시 정지한다.
+        /// </summary>
+        private void VideoBorder_MouseLeave(object sender, MouseEventArgs e)
+        {
+            _isVideoPopoutDragPending = false;
+
+            StopActiveHoverLensMove();
+        }
+
+        /// <summary>
+        /// GetHoveredCameraType 조회 함수.
+        /// </summary>
+        private VideoPopoutCameraType? GetHoveredCameraType()
+        {
+            if (EoVideoBorder != null && EoVideoBorder.IsMouseOver)
+            {
+                return VideoPopoutCameraType.Eo;
+            }
+
+            if (IrVideoBorder != null && IrVideoBorder.IsMouseOver)
+            {
+                return VideoPopoutCameraType.Ir;
+            }
+
+            // 영상 위에 마우스가 없더라도 W/S/A/D가 조용히 무시되지 않도록
+            // 현재 주 화면 카메라를 기본 제어 대상으로 사용한다.
+            return _primaryVideoType;
+        }
+
+        /// <summary>
+        /// IsLensShortcutKey 상태 확인 함수.
+        /// </summary>
+        private static bool IsLensShortcutKey(Key key)
+        {
+            return OpenCvWpfTracking.Common.ControlShortcutKeys.IsLensKey(key);
+        }
+
+        /// <summary>
+        /// StartHoverLensMove 시작 함수.
+        /// </summary>
+        private void StartHoverLensMove(VideoPopoutCameraType cameraType, Key key)
+        {
+            if (cameraType == VideoPopoutCameraType.Eo)
+            {
+                switch (key)
+                {
+                    case Key.W:
+                        vm?.StartEoZoomInMove();
+                        break;
+                    case Key.S:
+                        vm?.StartEoZoomOutMove();
+                        break;
+                    case Key.A:
+                        vm?.StartEoFocusNearMove();
+                        break;
+                    case Key.D:
+                        vm?.StartEoFocusFarMove();
+                        break;
+                }
+
+                return;
+            }
+
+            switch (key)
+            {
+                case Key.W:
+                    vm?.StartIrZoomInMove();
+                    break;
+                case Key.S:
+                    vm?.StartIrZoomOutMove();
+                    break;
+
+                // 2026-09-17: 실장비 상태값 기준 A=FOCUS+(Far/증가), D=FOCUS-(Near/감소)
+                case Key.A:
+                    vm?.StartIrFocusFarMove();
+                    break;
+                case Key.D:
+                    vm?.StartIrFocusNearMove();
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// StopActiveHoverLensMove 중지 함수.
+        /// </summary>
+        private void StopActiveHoverLensMove()
+        {
+            if (!_activeHoverLensKey.HasValue || !_activeHoverLensCameraType.HasValue)
+            {
+                return;
+            }
+
+            Key key = _activeHoverLensKey.Value;
+
+            VideoPopoutCameraType cameraType = _activeHoverLensCameraType.Value;
+
+            _activeHoverLensKey = null;
+            _activeHoverLensCameraType = null;
+
+            if (cameraType == VideoPopoutCameraType.Eo)
+            {
+                vm?.StopContinuousMove();
+
+                return;
+            }
+
+            if (key == Key.W || key == Key.S)
+            {
+                vm?.StopIrZoomMove();
+            }
+            else
+            {
+                vm?.StopIrFocusMove();
+            }
+        }
+
+        /// <summary>
+        /// HOME / ZERO 또는 AUTO SCAN 실행 중 키보드 전체 Lock 여부 확인
+        ///
+        /// PreviewKeyDown / PreviewKeyUp이 동일한 조건을 사용하도록
+        /// 공통 함수로 관리한다.
+        /// </summary>
+        private bool IsControlInputKeyboardLocked()
+        {
+            return vm?.IsControlInputLocked == true;
+        }
+
+        /// <summary>
+        /// Pan / Tilt 제어용 방향키 여부 확인
+        /// </summary>
+        private bool IsPanTiltDirectionKey(Key key)
+        {
+            return OpenCvWpfTracking.Common.ControlShortcutKeys.IsPanTiltKey(key);
+        }
+
+        /// <summary>
+        /// EO / IR 주화면 선택 단축키 여부 확인
+        ///
+        /// R:
+        /// EO 고배율 영상을 주화면으로 선택
+        ///
+        /// T:
+        /// IR 열영상을 주화면으로 선택
+        /// </summary>
+        private bool IsVideoSwitchKey(Key key)
+        {
+            return key == Key.R || key == Key.T;
+        }
+
+        /// <summary>
+        /// 현재 TextBox가 Keyboard Focus를 갖고 있는지 확인
+        ///
+        /// AI IP / Port / RTSP 주소 입력 중에는
+        /// 방향키를 장비 제어로 사용하지 않는다.
+        /// </summary>
+        private bool IsTextBoxKeyboardFocus()
+        {
+            return Keyboard.FocusedElement is TextBox;
+        }
+
+        /// <summary>
+        /// 2026-08-28: 이벤트 페이지 버튼의 좌·우 키 입력을 식별한다.
+        /// 메인 창 PTZ 단축키보다 하위 이벤트 컨트롤이 먼저 처리하도록 한다.
+        /// </summary>
+        private static bool IsEventPageNavigationKey(Key key)
+        {
+            if (key != Key.Left && key != Key.Right)
+            {
+                return false;
+            }
+
+            FrameworkElement focusedElement = Keyboard.FocusedElement as FrameworkElement;
+
+            string focusedName = focusedElement?.Name;
+
+            return focusedName == "AiPreviousButton" || focusedName == "AiNextButton" || focusedName == "FirePreviousButton" || focusedName == "FireNextButton";
+        }
+
+        #endregion
+
+        #region [팬·틸트 마우스 이벤트]
+
+        /// <summary>
+        /// [PAN] 좌측 버튼 MouseDown
+        /// </summary>
+        private void PanLeft_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", -1, 0);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [PAN] 우측 버튼 MouseDown
+        /// </summary>
+        private void PanRight_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", 1, 0);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [TILT] 위쪽 버튼 MouseDown
+        /// </summary>
+        private void TiltUp_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", 0, 1);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [TILT] 아래쪽 버튼 MouseDown
+        /// </summary>
+        private void TiltDown_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", 0, -1);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [PAN LEFT + TILT UP]
+        /// 좌측 상단 대각선 버튼 MouseDown
+        /// </summary>
+        private void PanLeftTiltUp_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", -1, 1);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [PAN RIGHT + TILT UP]
+        /// 우측 상단 대각선 버튼 MouseDown
+        /// </summary>
+        private void PanRightTiltUp_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", 1, 1);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [PAN LEFT + TILT DOWN]
+        /// 좌측 하단 대각선 버튼 MouseDown
+        /// </summary>
+        private void PanLeftTiltDown_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", -1, -1);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [PAN RIGHT + TILT DOWN]
+        /// 우측 하단 대각선 버튼 MouseDown
+        /// </summary>
+        private void PanRightTiltDown_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "PT", 1, -1);
+
+            e.Handled = true;
+        }
+
+        #endregion
+
+        #region [EO 줌·초점 마우스 이벤트]
+
+        /// <summary>
+        /// [EO] Zoom 확대 버튼 MouseDown
+        /// </summary>
+        private void EoZoomIn_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "EZ", 1, 0, false);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [EO] Zoom 축소 버튼 MouseDown
+        /// </summary>
+        private void EoZoomOut_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "EZ", -1, 0, false);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// EO Focus Near 연속 이동 시작
+        /// </summary>
+        private void EoFocusNear_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "EF", 1, 0, false);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// EO Focus Far 연속 이동 시작
+        /// </summary>
+        private void EoFocusFar_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "EF", -1, 0, false);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [EO] One Push Focus 버튼 MouseDown
+        /// </summary>
+        private void EoAutoFocus_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            vm?.StartEoAutoFocusMove();
+        }
+
+        #endregion
+
+        #region [IR 줌·초점 마우스 이벤트]
+
+        /// <summary>
+        /// [IR] Zoom 확대 버튼 MouseDown
+        /// </summary>
+        private void IrZoomIn_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
+
+            BeginMouseControl(sender, "IZ", 1, 0, true);
+        }
+
+        /// <summary>
+        /// [IR] Zoom 축소 버튼 MouseDown
+        /// </summary>
+        private void IrZoomOut_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
+
+            BeginMouseControl(sender, "IZ", -1, 0, true);
+        }
+
+        /// <summary>
+        /// [IR] Focus Near 버튼 MouseDown
+        /// </summary>
+        private void IrFocusNear_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "IF", 1, 0, true);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [IR] Focus Far 버튼 MouseDown
+        /// </summary>
+        private void IrFocusFar_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            BeginMouseControl(sender, "IF", -1, 0, true);
+
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// [IR] Digital Zoom 확대 버튼 MouseDown
+        /// </summary>
+        private void IrDigitalZoomIn_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            vm?.StartIrDigitalZoomInMove();
+        }
+
+        /// <summary>
+        /// [IR] Digital Zoom 축소 버튼 MouseDown
+        /// </summary>
+        private void IrDigitalZoomOut_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            vm?.StartIrDigitalZoomOutMove();
+        }
+
+        /// <summary>
+        /// [IR] Auto Focus 버튼 MouseDown
+        /// </summary>
+        private void IrAutoFocus_MouseDown(object sender, MouseButtonEventArgs e)
+        {
+            vm?.StartIrAutoFocusMove();
+        }
+
+        #endregion
+
+        #region [연속 동작 정지 이벤트]
+
+        /// <summary>
+        /// MouseUp 공통 연속 이동 정지
+        /// </summary>
+        private void MoveStop_MouseUp(object sender, MouseEventArgs e)
+        {
+            // 현재 버튼이 소유한 입력만 해제하고 다른 입력 소유자는 유지한다.
+            if (e is MouseButtonEventArgs button && button.ChangedButton == MouseButton.Left)
+            {
+                EndMouseControl(sender);
+            }
+        }
+
+        /// <summary>
+        /// MouseLeave 연속 이동 정지
+        ///
+        /// 버튼을 누른 상태로 영역 밖으로 이동한 경우에만
+        /// 정지 명령을 송신한다.
+        /// </summary>
+        private void MoveStop_MouseLeave(object sender, MouseEventArgs e)
+        {
+            if (e.LeftButton != MouseButtonState.Pressed)
+            {
+                return;
+            }
+
+            // 마우스를 캡처한 버튼은 영역 밖에서 놓아도 해제 이벤트를 받는다.
+            if (!(sender is UIElement element) || !element.IsMouseCaptured)
+            {
+                EndMouseControl(sender);
+            }
+        }
+
+        /// <summary>
+        /// 운용 제어 하위 탭을 선택할 때 이전 스크롤 위치를 남기지 않고
+        /// 첫 제목과 버튼이 완전히 보이는 위치로 이동한다.
+        /// </summary>
+        private void OperationScrollViewer_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (!(sender is ScrollViewer scrollViewer) || !(e.NewValue is bool isVisible) || !isVisible)
+            {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new Action(scrollViewer.ScrollToTop));
+        }
+        #endregion
+    }
+}
